@@ -505,13 +505,12 @@ impl VirtualTerminal {
                     }
                 }
             }
-            2 => {
+            2 | 3 => {
                 self.screen = (0..self.rows).map(|_| self.blank_row()).collect();
             }
-            3 => {
-                self.history.clear();
+            _ => {
+                self.screen = (0..self.rows).map(|_| self.blank_row()).collect();
             }
-            _ => {}
         }
     }
 
