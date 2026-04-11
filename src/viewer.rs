@@ -216,11 +216,46 @@ impl ViewerCore {
         Ok(rows)
     }
 
+    pub fn display_len(&mut self, content_width: usize) -> io::Result<usize> {
+        self.ensure_layout(content_width)?;
+        Ok(self
+            .layout_cache
+            .as_ref()
+            .expect("layout cache should exist after ensure_layout")
+            .display
+            .len())
+    }
+
+    pub fn display_row(
+        &mut self,
+        index: usize,
+        content_width: usize,
+    ) -> io::Result<Option<Vec<Cell>>> {
+        self.ensure_layout(content_width)?;
+        Ok(self
+            .layout_cache
+            .as_ref()
+            .expect("layout cache should exist after ensure_layout")
+            .display
+            .get(index)
+            .map(|(_, cells)| cells.clone()))
+    }
+
     pub fn status_text(
         &mut self,
         total_rows: usize,
         content_width: usize,
         status_width: usize,
+    ) -> io::Result<String> {
+        self.status_text_with_override(total_rows, content_width, status_width, None)
+    }
+
+    pub fn status_text_with_override(
+        &mut self,
+        total_rows: usize,
+        content_width: usize,
+        status_width: usize,
+        override_text: Option<&str>,
     ) -> io::Result<String> {
         self.ensure_layout(content_width)?;
         let cache = self
@@ -249,7 +284,9 @@ impl ViewerCore {
             max(line_count, 1),
             percent
         );
-        let mut text = if self.status.is_empty() {
+        let mut text = if let Some(text) = override_text {
+            text.to_string()
+        } else if self.status.is_empty() {
             default_status
         } else {
             self.status.clone()

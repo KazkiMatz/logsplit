@@ -11,8 +11,10 @@ use crossterm::queue;
 use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType};
 use logsplit_rs::{
-    Cell, ReplayFile, TerminalGuard, ViewerCore, VirtualTerminal, cell_prefix_width,
-    common_prefix_len, draw_cells,
+    Cell, ReplayFile, Selection, SelectionMode, SelectionPoint, TerminalGuard, ViewerCore,
+    VirtualTerminal, apply_selection_highlight, cell_prefix_width, common_prefix_len,
+    copy_to_clipboard, draw_cells, first_selectable_col, last_selectable_col, next_col,
+    normalize_col, previous_col, selection_text,
 };
 
 #[derive(Debug, Parser, Clone)]
@@ -51,6 +53,7 @@ struct ViewportDims {
 struct ViewerApp {
     args: Args,
     viewer: ViewerCore,
+    selection: Option<Selection>,
     needs_redraw: bool,
     previous_frame: Option<FrameSnapshot>,
 }
@@ -70,6 +73,7 @@ impl ViewerApp {
         Ok(Self {
             args,
             viewer,
+            selection: None,
             needs_redraw: true,
             previous_frame: None,
         })
@@ -109,6 +113,7 @@ impl ViewerApp {
             dims.height as usize,
             dims.content_width,
         )?;
+        self.selection = None;
         self.invalidate_frame();
         self.mark_dirty();
         Ok(())
@@ -116,13 +121,25 @@ impl ViewerApp {
 
     fn draw(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
         let dims = self.viewport_dims()?;
-        let content_rows = self
+        let mut content_rows = self
             .viewer
             .visible_rows(dims.height as usize, dims.content_width)?;
-        let status = self.viewer.status_text(
+        if let Some(selection) = self.selection {
+            for (offset, row) in content_rows.iter_mut().enumerate() {
+                apply_selection_highlight(row, self.viewer.top + offset, &selection);
+            }
+        }
+        let status_override = self.selection.map(|selection| {
+            format!(
+                "{}  h/j/k/l move  0/$ line  g/G file  y copy  Esc cancel",
+                selection_label(selection.mode)
+            )
+        });
+        let status = self.viewer.status_text_with_override(
             dims.height as usize,
             dims.content_width,
             dims.width as usize,
+            status_override.as_deref(),
         )?;
         let frame = FrameSnapshot {
             width: dims.width,
@@ -314,16 +331,381 @@ impl ViewerApp {
     }
 
     fn show_help(&mut self) {
-        self.viewer.status = "j/k, C-e/C-n/C-y scroll, space/b/C-f/C-b page, d/u half-page, g/G home/end, / search, n/N repeat, F follow, q quit".to_string();
+        self.viewer.status = "j/k, C-e/C-n/C-y scroll, space/b/C-f/C-b page, d/u half-page, g/G home/end, / search, n/N repeat, v/V visual select, F follow, q quit".to_string();
         self.mark_dirty();
     }
 
+    fn start_selection(&mut self, mode: SelectionMode) -> io::Result<()> {
+        let dims = self.viewport_dims()?;
+        self.viewer.follow = false;
+        let point = self.selection_start(dims)?;
+        self.selection = Some(Selection::new(mode, point));
+        self.viewer.status.clear();
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn selection_start(&mut self, dims: ViewportDims) -> io::Result<SelectionPoint> {
+        let total_rows = self.viewer.display_len(dims.content_width)?;
+        if total_rows == 0 {
+            return Ok(SelectionPoint { row: 0, col: 0 });
+        }
+        let visible_height = ViewerCore::content_height(dims.height as usize);
+        let visible_end = (self.viewer.top + visible_height).min(total_rows);
+        let mut row_index = self.viewer.top.min(total_rows.saturating_sub(1));
+        for candidate in self.viewer.top..visible_end {
+            if self
+                .viewer
+                .display_row(candidate, dims.content_width)?
+                .is_some_and(|row| !row.is_empty())
+            {
+                row_index = candidate;
+                break;
+            }
+        }
+        let row = self
+            .viewer
+            .display_row(row_index, dims.content_width)?
+            .unwrap_or_default();
+        Ok(SelectionPoint {
+            row: row_index,
+            col: first_selectable_col(&row),
+        })
+    }
+
+    fn ensure_selection_visible(&mut self, dims: ViewportDims, row_index: usize) {
+        let visible_height = ViewerCore::content_height(dims.height as usize);
+        if row_index < self.viewer.top {
+            self.viewer.top = row_index;
+        } else if visible_height > 0 && row_index >= self.viewer.top + visible_height {
+            self.viewer.top = row_index.saturating_sub(visible_height.saturating_sub(1));
+        }
+    }
+
+    fn move_selection_row(&mut self, amount: isize) -> io::Result<()> {
+        let dims = self.viewport_dims()?;
+        let total_rows = self.viewer.display_len(dims.content_width)?;
+        if total_rows == 0 {
+            return Ok(());
+        }
+        let mut selection = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        let max_row = total_rows.saturating_sub(1) as isize;
+        let new_row = (selection.cursor.row as isize + amount).clamp(0, max_row) as usize;
+        let row = self
+            .viewer
+            .display_row(new_row, dims.content_width)?
+            .unwrap_or_default();
+        let new_col = if row.is_empty() {
+            0
+        } else {
+            normalize_col(&row, selection.cursor.col)
+        };
+        selection.cursor = SelectionPoint {
+            row: new_row,
+            col: new_col,
+        };
+        self.selection = Some(selection);
+        self.ensure_selection_visible(dims, new_row);
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn move_selection_col(&mut self, forward: bool) -> io::Result<()> {
+        let dims = self.viewport_dims()?;
+        let mut selection = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        let row = self
+            .viewer
+            .display_row(selection.cursor.row, dims.content_width)?
+            .unwrap_or_default();
+        selection.cursor.col = if row.is_empty() {
+            0
+        } else if forward {
+            next_col(&row, selection.cursor.col)
+        } else {
+            previous_col(&row, selection.cursor.col)
+        };
+        self.selection = Some(selection);
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn move_selection_line_edge(&mut self, to_end: bool) -> io::Result<()> {
+        let dims = self.viewport_dims()?;
+        let mut selection = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        let row = self
+            .viewer
+            .display_row(selection.cursor.row, dims.content_width)?
+            .unwrap_or_default();
+        selection.cursor.col = if row.is_empty() {
+            0
+        } else if to_end {
+            last_selectable_col(&row)
+        } else {
+            0
+        };
+        self.selection = Some(selection);
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn jump_selection_file_edge(&mut self, to_end: bool) -> io::Result<()> {
+        let dims = self.viewport_dims()?;
+        let total_rows = self.viewer.display_len(dims.content_width)?;
+        if total_rows == 0 {
+            return Ok(());
+        }
+        let target_row = if to_end { total_rows - 1 } else { 0 };
+        let row = self
+            .viewer
+            .display_row(target_row, dims.content_width)?
+            .unwrap_or_default();
+        let mut selection = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        selection.cursor = SelectionPoint {
+            row: target_row,
+            col: if row.is_empty() {
+                0
+            } else if to_end {
+                last_selectable_col(&row)
+            } else {
+                first_selectable_col(&row)
+            },
+        };
+        self.selection = Some(selection);
+        self.ensure_selection_visible(dims, target_row);
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn copy_selection(&mut self) -> io::Result<()> {
+        let dims = self.viewport_dims()?;
+        let Some(selection) = self.selection else {
+            return Ok(());
+        };
+        let text = selection_text(selection, |row| {
+            self.viewer
+                .display_row(row, dims.content_width)
+                .ok()
+                .flatten()
+        });
+        match copy_to_clipboard(&text) {
+            Ok(()) => {
+                self.viewer.status = format!(
+                    "Copied {} displayed line{}",
+                    selection.line_span(),
+                    if selection.line_span() == 1 { "" } else { "s" }
+                );
+                self.selection = None;
+            }
+            Err(err) => {
+                self.viewer.status = format!("Clipboard copy failed: {}", err);
+            }
+        }
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn cancel_selection(&mut self, message: Option<&str>) {
+        self.selection = None;
+        if let Some(message) = message {
+            self.viewer.status = message.to_string();
+        } else {
+            self.viewer.status.clear();
+        }
+        self.mark_dirty();
+    }
+
+    fn handle_selection_key(&mut self, key: KeyEvent) -> io::Result<()> {
+        match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => self.cancel_selection(Some("Selection cleared")),
+            KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('Y'),
+                ..
+            } => {
+                self.copy_selection()?;
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.move_selection_row(1)?,
+            KeyEvent {
+                code: KeyCode::Up, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.move_selection_row(-1)?,
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_col(false)?,
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_col(true)?,
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char(' ' | 'f'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                let step =
+                    ViewerCore::content_height(self.viewport_dims()?.height as usize) as isize;
+                self.move_selection_row(step.max(1))?;
+            }
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                let step =
+                    ViewerCore::content_height(self.viewport_dims()?.height as usize) as isize;
+                self.move_selection_row(-(step.max(1)))?;
+            }
+            KeyEvent {
+                code: KeyCode::Char('d'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('d'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                let step = (ViewerCore::content_height(self.viewport_dims()?.height as usize) / 2)
+                    .max(1) as isize;
+                self.move_selection_row(step)?;
+            }
+            KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                let step = (ViewerCore::content_height(self.viewport_dims()?.height as usize) / 2)
+                    .max(1) as isize;
+                self.move_selection_row(-step)?;
+            }
+            KeyEvent {
+                code: KeyCode::Char('0'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_line_edge(false)?,
+            KeyEvent {
+                code: KeyCode::Char('$'),
+                ..
+            } => self.move_selection_line_edge(true)?,
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.jump_selection_file_edge(false)?,
+            KeyEvent {
+                code: KeyCode::End, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('G'),
+                ..
+            } => self.jump_selection_file_edge(true)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn handle_key(&mut self, stdout: &mut io::Stdout, key: KeyEvent) -> io::Result<bool> {
+        if self.selection.is_some() {
+            self.handle_selection_key(key)?;
+            return Ok(false);
+        }
+
         match key {
             KeyEvent {
                 code: KeyCode::Char('q' | 'Q'),
                 ..
             } => return Ok(true),
+            KeyEvent {
+                code: KeyCode::Char('v'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.start_selection(SelectionMode::Character)?,
+            KeyEvent {
+                code: KeyCode::Char('V'),
+                ..
+            } => self.start_selection(SelectionMode::Line)?,
             KeyEvent {
                 code: KeyCode::Down | KeyCode::Enter,
                 ..
@@ -584,4 +966,11 @@ fn main() -> io::Result<()> {
 
     let mut app = ViewerApp::new(args)?;
     app.run()
+}
+
+fn selection_label(mode: SelectionMode) -> &'static str {
+    match mode {
+        SelectionMode::Character => "VISUAL",
+        SelectionMode::Line => "V-LINE",
+    }
 }

@@ -15,8 +15,10 @@ use crossterm::queue;
 use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
 use crossterm::terminal;
 use logsplit_rs::{
-    Cell, Style, TerminalGuard, ViewerCore, VirtualTerminal, clear_segment, draw_cells,
-    overlay_cells,
+    Cell, Selection, SelectionMode, SelectionPoint, Style, TerminalGuard, ViewerCore,
+    VirtualTerminal, WordMotion, apply_selection_highlight, clear_segment, copy_to_clipboard,
+    debug_log, draw_cells, first_selectable_col, last_selectable_col, move_word_point, next_col,
+    normalize_col, overlay_cells, paste_from_clipboard, previous_col, row_to_text, selection_text,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -41,10 +43,23 @@ enum Focus {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveSelection {
+    pane: Focus,
+    selection: Selection,
+}
+
 #[derive(Debug)]
 enum PaneMsg {
     Data(Vec<u8>),
     Eof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenPosition {
+    Top,
+    Middle,
+    Bottom,
 }
 
 struct Pane {
@@ -119,45 +134,72 @@ struct App {
     right: Pane,
     focus: Focus,
     prefix_pending: bool,
+    switch_prefix_pending: bool,
+    left_cursor: SelectionPoint,
+    selection: Option<ActiveSelection>,
     logfile: PathBuf,
     previous_frame: Option<FrameSnapshot>,
 }
 
 impl App {
     fn new(line: String) -> io::Result<Self> {
+        debug_log(&format!("App::new line={line}"));
         let dims = split_dims()?;
+        debug_log(&format!(
+            "split_dims rows={} left_cols={} right_cols={}",
+            dims.rows, dims.left_cols, dims.right_cols
+        ));
         let logfile = make_logfile_path(&line)?;
+        debug_log(&format!("logfile={}", logfile.display()));
         if let Some(parent) = logfile.parent() {
             fs::create_dir_all(parent)?;
+            debug_log(&format!("created log dir {}", parent.display()));
         }
         let _ = File::create(&logfile)?;
+        debug_log("created empty logfile");
 
         let mut left = ViewerCore::new(logfile.clone(), dims.rows, dims.right_cols, true)?;
+        debug_log("ViewerCore::new ok");
         left.jump_to_end(dims.rows, dims.left_cols)?;
+        debug_log("left.jump_to_end ok");
         let right = spawn_logged_command(&line, &logfile, dims.rows, dims.right_cols)?;
+        debug_log("spawn_logged_command ok");
 
-        Ok(Self {
+        let mut app = Self {
             left,
             right,
             focus: Focus::Right,
             prefix_pending: false,
+            switch_prefix_pending: false,
+            left_cursor: SelectionPoint { row: 0, col: 0 },
+            selection: None,
             logfile,
             previous_frame: None,
-        })
+        };
+        app.left_cursor = app.default_left_cursor(&dims)?;
+        Ok(app)
     }
 
     fn run(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
+        debug_log("about to enter TerminalGuard");
         let _guard = TerminalGuard::enter(&mut stdout)?;
+        debug_log("TerminalGuard entered");
         let mut needs_redraw = true;
 
         loop {
             let dims = split_dims()?;
             let mut changed = false;
             changed |= self.left.poll(dims.rows, dims.left_cols)?;
+            if self.left.follow {
+                self.snap_left_cursor_to_end(&dims)?;
+            } else {
+                self.normalize_left_cursor(&dims)?;
+            }
             changed |= self.right.drain();
 
             if self.right.exited()? {
+                debug_log("right pane exited; leaving run loop");
                 break;
             }
 
@@ -193,8 +235,15 @@ impl App {
                     )?;
                     if self.left.follow {
                         self.left.jump_to_end(dims.rows, dims.left_cols)?;
+                        self.snap_left_cursor_to_end(&dims)?;
+                    } else {
+                        self.normalize_left_cursor(&dims)?;
+                        self.ensure_left_selection_visible(&dims, self.left_cursor.row);
                     }
                     self.right.resize(dims.rows, dims.right_cols)?;
+                    if self.selection.take().is_some() {
+                        self.left.status = "Selection cleared after resize".to_string();
+                    }
                     self.previous_frame = None;
                     needs_redraw = true;
                 }
@@ -224,13 +273,35 @@ impl App {
 
     fn build_frame(&mut self, dims: &SplitDims) -> io::Result<FrameSnapshot> {
         let total_width = dims.left_cols + 1 + dims.right_cols;
-        let left_rows = self.left.visible_rows(dims.rows, dims.left_cols)?;
-        let status_text = self
-            .left
-            .status_text(dims.rows, dims.left_cols, dims.left_cols)?;
+        let mut left_rows = self.left.visible_rows(dims.rows, dims.left_cols)?;
+        if let Some(selection) = self
+            .selection
+            .filter(|selection| selection.pane == Focus::Left)
+        {
+            for (offset, row) in left_rows.iter_mut().enumerate() {
+                apply_selection_highlight(row, self.left.top + offset, &selection.selection);
+            }
+        }
+        let left_cursor = self.normalize_left_cursor(dims)?;
+        if left_cursor.row >= self.left.top {
+            let visible_offset = left_cursor.row - self.left.top;
+            if let Some(row) = left_rows.get_mut(visible_offset) {
+                apply_cursor_highlight(row, left_cursor.col, self.focus == Focus::Left);
+            }
+        }
+        let status_override = self.status_override_text();
+        let status_text = self.left.status_text_with_override(
+            dims.rows,
+            dims.left_cols,
+            dims.left_cols,
+            status_override.as_deref(),
+        )?;
         let left_status = reverse_status_cells(&status_text, dims.left_cols);
         let blank = Cell::blank(Style::default());
         let mut rows = Vec::with_capacity(dims.rows);
+        let active_right_selection = self
+            .selection
+            .filter(|selection| selection.pane == Focus::Right);
 
         for y in 0..dims.rows {
             let mut row = vec![blank; total_width];
@@ -242,7 +313,11 @@ impl App {
             }
             row[dims.separator_col] = self.separator_cell(y);
             if let Some(right_row) = self.right.term.screen_rows().get(y) {
-                overlay_cells(&mut row, dims.separator_col + 1, right_row, dims.right_cols);
+                let mut rendered = right_row.clone();
+                if let Some(selection) = active_right_selection {
+                    apply_selection_highlight(&mut rendered, y, &selection.selection);
+                }
+                overlay_cells(&mut row, dims.separator_col + 1, &rendered, dims.right_cols);
             }
             rows.push(row);
         }
@@ -257,7 +332,9 @@ impl App {
 
     fn separator_cell(&self, y: usize) -> Cell {
         let ch = if y == 0 {
-            if self.prefix_pending {
+            if self.switch_prefix_pending {
+                'w'
+            } else if self.prefix_pending {
                 '*'
             } else {
                 match self.focus {
@@ -408,12 +485,25 @@ impl App {
     }
 
     fn show_left_help(&mut self) {
-        self.left.status = "j/k, C-e/C-n/C-y scroll, space/b/C-f/C-b page, d/u half-page, g/G home/end, / search, n/N repeat, F follow, Ctrl-g q quit".to_string();
+        self.left.status = "h/j/k/l move cursor, w/e/b words, C-n and arrows move, C-e/C-y scroll view, space/f/C-f page down, C-b page up, d/u half-page, 0/$ line, g/G file, H/M/L screen, / search, n/N repeat, v/V visual select, Ctrl-w h/l switch pane, p paste to right, ? help, Ctrl-g v/V/p/q extra actions".to_string();
     }
 
     fn handle_left_key(&mut self, stdout: &mut io::Stdout, key: KeyEvent) -> io::Result<()> {
-        let dims = split_dims()?;
         match key {
+            KeyEvent {
+                code: KeyCode::Char('v'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.start_selection(SelectionMode::Character)?,
+            KeyEvent {
+                code: KeyCode::Char('V'),
+                ..
+            } => self.start_selection(SelectionMode::Line)?,
+            KeyEvent {
+                code: KeyCode::Char('p' | 'P'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.paste_right_from_clipboard(),
             KeyEvent {
                 code: KeyCode::Char('q' | 'Q'),
                 ..
@@ -433,14 +523,12 @@ impl App {
                 code: KeyCode::Char('n'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            }
-            | KeyEvent {
+            } => self.move_left_cursor_row(1)?,
+            KeyEvent {
                 code: KeyCode::Char('e'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => {
-                self.left.scroll(1, dims.rows, dims.left_cols)?;
-            }
+            } => self.scroll_left_view_preserve_cursor(1)?,
             KeyEvent {
                 code: KeyCode::Up, ..
             }
@@ -448,14 +536,45 @@ impl App {
                 code: KeyCode::Char('k'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }
-            | KeyEvent {
+            } => self.move_left_cursor_row(-1)?,
+            KeyEvent {
                 code: KeyCode::Char('y'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => {
-                self.left.scroll(-1, dims.rows, dims.left_cols)?;
+            } => self.scroll_left_view_preserve_cursor(-1)?,
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
             }
+            | KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_left_cursor_col(false)?,
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_left_cursor_col(true)?,
+            KeyEvent {
+                code: KeyCode::Char('w'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_left_cursor_word(WordMotion::ForwardStart)?,
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_left_cursor_word(WordMotion::ForwardEnd)?,
+            KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_left_cursor_word(WordMotion::BackwardStart)?,
             KeyEvent {
                 code: KeyCode::PageDown,
                 ..
@@ -469,25 +588,16 @@ impl App {
                 code: KeyCode::Char('f'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => {
-                self.left.page(1, dims.rows, dims.left_cols)?;
-            }
+            } => self.move_left_cursor_page(1)?,
             KeyEvent {
                 code: KeyCode::PageUp,
                 ..
             }
             | KeyEvent {
                 code: KeyCode::Char('b'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('b'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => {
-                self.left.page(-1, dims.rows, dims.left_cols)?;
-            }
+            } => self.move_left_cursor_page(-1)?,
             KeyEvent {
                 code: KeyCode::Char('d'),
                 modifiers: KeyModifiers::NONE,
@@ -497,9 +607,7 @@ impl App {
                 code: KeyCode::Char('d'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => {
-                self.left.half_page(1, dims.rows, dims.left_cols)?;
-            }
+            } => self.move_left_cursor_half_page(1)?,
             KeyEvent {
                 code: KeyCode::Char('u'),
                 modifiers: KeyModifiers::NONE,
@@ -509,9 +617,16 @@ impl App {
                 code: KeyCode::Char('u'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => {
-                self.left.half_page(-1, dims.rows, dims.left_cols)?;
-            }
+            } => self.move_left_cursor_half_page(-1)?,
+            KeyEvent {
+                code: KeyCode::Char('0'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_left_cursor_line_edge(false)?,
+            KeyEvent {
+                code: KeyCode::Char('$'),
+                ..
+            } => self.move_left_cursor_line_edge(true)?,
             KeyEvent {
                 code: KeyCode::Home,
                 ..
@@ -520,28 +635,34 @@ impl App {
                 code: KeyCode::Char('g'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => {
-                self.left.follow = false;
-                self.left.top = 0;
-                self.left.status.clear();
-            }
+            } => self.jump_left_cursor_file_edge(false)?,
             KeyEvent {
                 code: KeyCode::End, ..
             }
             | KeyEvent {
                 code: KeyCode::Char('G'),
                 ..
-            } => {
-                self.left.follow = false;
-                self.left.jump_to_end(dims.rows, dims.left_cols)?;
-                self.left.status.clear();
-            }
+            } => self.jump_left_cursor_file_edge(true)?,
+            KeyEvent {
+                code: KeyCode::Char('H'),
+                ..
+            } => self.move_left_cursor_screen_position(ScreenPosition::Top)?,
+            KeyEvent {
+                code: KeyCode::Char('M'),
+                ..
+            } => self.move_left_cursor_screen_position(ScreenPosition::Middle)?,
+            KeyEvent {
+                code: KeyCode::Char('L'),
+                ..
+            } => self.move_left_cursor_screen_position(ScreenPosition::Bottom)?,
             KeyEvent {
                 code: KeyCode::Char('F'),
                 ..
             } => {
+                let dims = split_dims()?;
                 self.left.follow = true;
                 self.left.jump_to_end(dims.rows, dims.left_cols)?;
+                self.snap_left_cursor_to_end(&dims)?;
                 self.left.status = "Follow mode".to_string();
             }
             KeyEvent {
@@ -557,10 +678,15 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
+                let dims = split_dims()?;
                 self.left
                     .resize_source(dims.rows, dims.right_cols, dims.rows, dims.left_cols)?;
                 if self.left.follow {
                     self.left.jump_to_end(dims.rows, dims.left_cols)?;
+                    self.snap_left_cursor_to_end(&dims)?;
+                } else {
+                    self.normalize_left_cursor(&dims)?;
+                    self.ensure_left_selection_visible(&dims, self.left_cursor.row);
                 }
                 self.left.status = "Reloaded".to_string();
                 self.previous_frame = None;
@@ -570,6 +696,7 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
+                let dims = split_dims()?;
                 let term = self.prompt_left(stdout, "/", dims.left_cols)?;
                 if !term.is_empty() {
                     self.left.search_term = Some(term.clone());
@@ -577,6 +704,11 @@ impl App {
                     if !self.left.search(&term, true, dims.rows, dims.left_cols)? {
                         self.left.status = format!("Pattern not found: {}", term);
                     } else {
+                        self.left_cursor = SelectionPoint {
+                            row: self.left.top,
+                            col: 0,
+                        };
+                        self.normalize_left_cursor(&dims)?;
                         self.left.status = format!("/{}", term);
                     }
                 } else {
@@ -588,29 +720,36 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
+                let dims = split_dims()?;
                 self.left.repeat_search(
                     self.left.last_search_forward,
                     dims.rows,
                     dims.left_cols,
                 )?;
+                self.left_cursor = SelectionPoint {
+                    row: self.left.top,
+                    col: 0,
+                };
+                self.normalize_left_cursor(&dims)?;
             }
             KeyEvent {
                 code: KeyCode::Char('N'),
                 ..
             } => {
+                let dims = split_dims()?;
                 self.left.repeat_search(
                     !self.left.last_search_forward,
                     dims.rows,
                     dims.left_cols,
                 )?;
+                self.left_cursor = SelectionPoint {
+                    row: self.left.top,
+                    col: 0,
+                };
+                self.normalize_left_cursor(&dims)?;
             }
             KeyEvent {
                 code: KeyCode::Char('?'),
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('h'),
-                modifiers: KeyModifiers::NONE,
                 ..
             } => self.show_left_help(),
             _ => {}
@@ -618,31 +757,917 @@ impl App {
         Ok(())
     }
 
+    fn start_selection(&mut self, mode: SelectionMode) -> io::Result<()> {
+        let dims = split_dims()?;
+        let point = match self.focus {
+            Focus::Left => {
+                self.left.follow = false;
+                self.left_selection_start(&dims)?
+            }
+            Focus::Right => self.right_selection_start(),
+        };
+        self.selection = Some(ActiveSelection {
+            pane: self.focus,
+            selection: Selection::new(mode, point),
+        });
+        self.left.status.clear();
+        Ok(())
+    }
+
+    fn default_left_cursor(&mut self, dims: &SplitDims) -> io::Result<SelectionPoint> {
+        let total_rows = self.left.display_len(dims.left_cols)?;
+        if total_rows == 0 {
+            return Ok(SelectionPoint { row: 0, col: 0 });
+        }
+        let visible_height = ViewerCore::content_height(dims.rows);
+        let visible_end = (self.left.top + visible_height).min(total_rows);
+        let mut row_index = self.left.top.min(total_rows.saturating_sub(1));
+        for candidate in (self.left.top..visible_end).rev() {
+            if self
+                .left
+                .display_row(candidate, dims.left_cols)?
+                .is_some_and(|row| !row.is_empty())
+            {
+                row_index = candidate;
+                break;
+            }
+        }
+        let row = self
+            .left
+            .display_row(row_index, dims.left_cols)?
+            .unwrap_or_default();
+        Ok(SelectionPoint {
+            row: row_index,
+            col: first_selectable_col(&row),
+        })
+    }
+
+    fn normalize_left_cursor(&mut self, dims: &SplitDims) -> io::Result<SelectionPoint> {
+        let total_rows = self.left.display_len(dims.left_cols)?;
+        if total_rows == 0 {
+            self.left_cursor = SelectionPoint { row: 0, col: 0 };
+            return Ok(self.left_cursor);
+        }
+        self.left_cursor.row = self.left_cursor.row.min(total_rows.saturating_sub(1));
+        let row = self
+            .left
+            .display_row(self.left_cursor.row, dims.left_cols)?
+            .unwrap_or_default();
+        self.left_cursor.col = if row.is_empty() {
+            0
+        } else {
+            normalize_col(&row, self.left_cursor.col)
+        };
+        Ok(self.left_cursor)
+    }
+
+    fn left_selection_start(&mut self, dims: &SplitDims) -> io::Result<SelectionPoint> {
+        self.normalize_left_cursor(dims)
+    }
+
+    fn right_selection_start(&self) -> SelectionPoint {
+        let rows = self.right.term.screen_rows();
+        let mut row_index = rows.len().saturating_sub(1);
+        for candidate in (0..rows.len()).rev() {
+            if !row_to_text(&rows[candidate]).is_empty() {
+                row_index = candidate;
+                break;
+            }
+        }
+        let row = rows.get(row_index).cloned().unwrap_or_default();
+        SelectionPoint {
+            row: row_index,
+            col: first_selectable_col(&row),
+        }
+    }
+
+    fn ensure_left_selection_visible(&mut self, dims: &SplitDims, row_index: usize) {
+        let visible_height = ViewerCore::content_height(dims.rows);
+        if row_index < self.left.top {
+            self.left.top = row_index;
+        } else if visible_height > 0 && row_index >= self.left.top + visible_height {
+            self.left.top = row_index.saturating_sub(visible_height.saturating_sub(1));
+        }
+    }
+
+    fn snap_left_cursor_to_end(&mut self, dims: &SplitDims) -> io::Result<()> {
+        let total_rows = self.left.display_len(dims.left_cols)?;
+        if total_rows == 0 {
+            self.left_cursor = SelectionPoint { row: 0, col: 0 };
+            return Ok(());
+        }
+        self.left_cursor.row = total_rows - 1;
+        let row = self
+            .left
+            .display_row(self.left_cursor.row, dims.left_cols)?
+            .unwrap_or_default();
+        self.left_cursor.col = if row.is_empty() {
+            0
+        } else {
+            first_selectable_col(&row)
+        };
+        Ok(())
+    }
+
+    fn move_left_cursor_row(&mut self, amount: isize) -> io::Result<()> {
+        let dims = split_dims()?;
+        self.left.follow = false;
+        let total_rows = self.left.display_len(dims.left_cols)?;
+        if total_rows == 0 {
+            self.left_cursor = SelectionPoint { row: 0, col: 0 };
+            return Ok(());
+        }
+        self.normalize_left_cursor(&dims)?;
+        let max_row = total_rows.saturating_sub(1) as isize;
+        self.left_cursor.row = (self.left_cursor.row as isize + amount).clamp(0, max_row) as usize;
+        let row = self
+            .left
+            .display_row(self.left_cursor.row, dims.left_cols)?
+            .unwrap_or_default();
+        self.left_cursor.col = if row.is_empty() {
+            0
+        } else {
+            normalize_col(&row, self.left_cursor.col)
+        };
+        self.ensure_left_selection_visible(&dims, self.left_cursor.row);
+        self.left.status.clear();
+        Ok(())
+    }
+
+    fn move_left_cursor_col(&mut self, forward: bool) -> io::Result<()> {
+        let dims = split_dims()?;
+        self.left.follow = false;
+        let row_index = self.normalize_left_cursor(&dims)?.row;
+        let row = self
+            .left
+            .display_row(row_index, dims.left_cols)?
+            .unwrap_or_default();
+        self.left_cursor.col = if row.is_empty() {
+            0
+        } else if forward {
+            next_col(&row, self.left_cursor.col)
+        } else {
+            previous_col(&row, self.left_cursor.col)
+        };
+        self.left.status.clear();
+        Ok(())
+    }
+
+    fn move_left_cursor_page(&mut self, amount: isize) -> io::Result<()> {
+        let dims = split_dims()?;
+        let step = ViewerCore::content_height(dims.rows).max(1) as isize;
+        self.move_left_cursor_row(amount * step)
+    }
+
+    fn move_left_cursor_half_page(&mut self, amount: isize) -> io::Result<()> {
+        let dims = split_dims()?;
+        let step = (ViewerCore::content_height(dims.rows) / 2).max(1) as isize;
+        self.move_left_cursor_row(amount * step)
+    }
+
+    fn move_left_cursor_line_edge(&mut self, to_end: bool) -> io::Result<()> {
+        let dims = split_dims()?;
+        self.left.follow = false;
+        let row_index = self.normalize_left_cursor(&dims)?.row;
+        let row = self
+            .left
+            .display_row(row_index, dims.left_cols)?
+            .unwrap_or_default();
+        self.left_cursor.col = if row.is_empty() {
+            0
+        } else if to_end {
+            last_selectable_col(&row)
+        } else {
+            0
+        };
+        self.left.status.clear();
+        Ok(())
+    }
+
+    fn move_left_cursor_word(&mut self, motion: WordMotion) -> io::Result<()> {
+        let dims = split_dims()?;
+        self.left.follow = false;
+        let total_rows = self.left.display_len(dims.left_cols)?;
+        if total_rows == 0 {
+            self.left_cursor = SelectionPoint { row: 0, col: 0 };
+            return Ok(());
+        }
+        let start = self.normalize_left_cursor(&dims)?;
+        self.left_cursor = move_word_point(
+            start,
+            total_rows,
+            |row| self.left.display_row(row, dims.left_cols),
+            motion,
+        )?;
+        self.ensure_left_selection_visible(&dims, self.left_cursor.row);
+        self.left.status.clear();
+        Ok(())
+    }
+
+    fn scroll_left_view_preserve_cursor(&mut self, amount: isize) -> io::Result<()> {
+        let dims = split_dims()?;
+        self.left.follow = false;
+        let total_rows = self.left.display_len(dims.left_cols)?;
+        if total_rows == 0 {
+            self.left_cursor = SelectionPoint { row: 0, col: 0 };
+            return Ok(());
+        }
+        self.normalize_left_cursor(&dims)?;
+        let visible_height = ViewerCore::content_height(dims.rows);
+        let max_top = total_rows.saturating_sub(visible_height);
+        let old_top = self.left.top as isize;
+        let new_top = (old_top + amount).clamp(0, max_top as isize) as usize;
+        self.left.top = new_top;
+        if visible_height > 0 {
+            if self.left_cursor.row < self.left.top {
+                self.left_cursor.row = self.left.top;
+            } else {
+                let visible_end = self.left.top + visible_height;
+                if self.left_cursor.row >= visible_end {
+                    self.left_cursor.row = visible_end.saturating_sub(1);
+                }
+            }
+        }
+        let row = self
+            .left
+            .display_row(self.left_cursor.row, dims.left_cols)?
+            .unwrap_or_default();
+        self.left_cursor.col = if row.is_empty() {
+            0
+        } else {
+            normalize_col(&row, self.left_cursor.col)
+        };
+        self.left.status.clear();
+        Ok(())
+    }
+
+    fn move_left_cursor_screen_position(&mut self, target: ScreenPosition) -> io::Result<()> {
+        let dims = split_dims()?;
+        self.left.follow = false;
+        let total_rows = self.left.display_len(dims.left_cols)?;
+        if total_rows == 0 {
+            self.left_cursor = SelectionPoint { row: 0, col: 0 };
+            return Ok(());
+        }
+        let visible_height = ViewerCore::content_height(dims.rows);
+        let visible_end = (self.left.top + visible_height).min(total_rows);
+        if visible_end <= self.left.top {
+            return Ok(());
+        }
+        let visible_count = visible_end - self.left.top;
+        self.left_cursor.row = match target {
+            ScreenPosition::Top => self.left.top,
+            ScreenPosition::Middle => self.left.top + visible_count.saturating_sub(1) / 2,
+            ScreenPosition::Bottom => visible_end - 1,
+        };
+        let row = self
+            .left
+            .display_row(self.left_cursor.row, dims.left_cols)?
+            .unwrap_or_default();
+        self.left_cursor.col = if row.is_empty() {
+            0
+        } else {
+            first_selectable_col(&row)
+        };
+        self.left.status.clear();
+        Ok(())
+    }
+
+    fn jump_left_cursor_file_edge(&mut self, to_end: bool) -> io::Result<()> {
+        let dims = split_dims()?;
+        self.left.follow = false;
+        let total_rows = self.left.display_len(dims.left_cols)?;
+        if total_rows == 0 {
+            self.left_cursor = SelectionPoint { row: 0, col: 0 };
+            return Ok(());
+        }
+        self.left_cursor.row = if to_end { total_rows - 1 } else { 0 };
+        let row = self
+            .left
+            .display_row(self.left_cursor.row, dims.left_cols)?
+            .unwrap_or_default();
+        self.left_cursor.col = if row.is_empty() {
+            0
+        } else if to_end {
+            last_selectable_col(&row)
+        } else {
+            first_selectable_col(&row)
+        };
+        self.ensure_left_selection_visible(&dims, self.left_cursor.row);
+        self.left.status.clear();
+        Ok(())
+    }
+
+    fn clear_switch_prefix(&mut self) {
+        self.switch_prefix_pending = false;
+    }
+
+    fn move_selection_row(&mut self, amount: isize) -> io::Result<()> {
+        let dims = split_dims()?;
+        let mut active = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        match active.pane {
+            Focus::Left => {
+                let total_rows = self.left.display_len(dims.left_cols)?;
+                if total_rows == 0 {
+                    return Ok(());
+                }
+                let max_row = total_rows.saturating_sub(1) as isize;
+                let new_row =
+                    (active.selection.cursor.row as isize + amount).clamp(0, max_row) as usize;
+                let row = self
+                    .left
+                    .display_row(new_row, dims.left_cols)?
+                    .unwrap_or_default();
+                active.selection.cursor = SelectionPoint {
+                    row: new_row,
+                    col: if row.is_empty() {
+                        0
+                    } else {
+                        normalize_col(&row, active.selection.cursor.col)
+                    },
+                };
+                self.left_cursor = active.selection.cursor;
+                self.ensure_left_selection_visible(&dims, new_row);
+            }
+            Focus::Right => {
+                let rows = self.right.term.screen_rows();
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                let max_row = rows.len().saturating_sub(1) as isize;
+                let new_row =
+                    (active.selection.cursor.row as isize + amount).clamp(0, max_row) as usize;
+                let row = rows.get(new_row).cloned().unwrap_or_default();
+                active.selection.cursor = SelectionPoint {
+                    row: new_row,
+                    col: if row.is_empty() {
+                        0
+                    } else {
+                        normalize_col(&row, active.selection.cursor.col)
+                    },
+                };
+            }
+        }
+        self.selection = Some(active);
+        Ok(())
+    }
+
+    fn move_selection_col(&mut self, forward: bool) -> io::Result<()> {
+        let dims = split_dims()?;
+        let mut active = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        let row = match active.pane {
+            Focus::Left => self
+                .left
+                .display_row(active.selection.cursor.row, dims.left_cols)?
+                .unwrap_or_default(),
+            Focus::Right => self
+                .right
+                .term
+                .screen_rows()
+                .get(active.selection.cursor.row)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        active.selection.cursor.col = if row.is_empty() {
+            0
+        } else if forward {
+            next_col(&row, active.selection.cursor.col)
+        } else {
+            previous_col(&row, active.selection.cursor.col)
+        };
+        if active.pane == Focus::Left {
+            self.left_cursor = active.selection.cursor;
+        }
+        self.selection = Some(active);
+        Ok(())
+    }
+
+    fn move_selection_line_edge(&mut self, to_end: bool) -> io::Result<()> {
+        let dims = split_dims()?;
+        let mut active = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        let row = match active.pane {
+            Focus::Left => self
+                .left
+                .display_row(active.selection.cursor.row, dims.left_cols)?
+                .unwrap_or_default(),
+            Focus::Right => self
+                .right
+                .term
+                .screen_rows()
+                .get(active.selection.cursor.row)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        active.selection.cursor.col = if row.is_empty() {
+            0
+        } else if to_end {
+            last_selectable_col(&row)
+        } else {
+            0
+        };
+        if active.pane == Focus::Left {
+            self.left_cursor = active.selection.cursor;
+        }
+        self.selection = Some(active);
+        Ok(())
+    }
+
+    fn move_selection_word(&mut self, motion: WordMotion) -> io::Result<()> {
+        let dims = split_dims()?;
+        let mut active = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        match active.pane {
+            Focus::Left => {
+                let total_rows = self.left.display_len(dims.left_cols)?;
+                if total_rows == 0 {
+                    return Ok(());
+                }
+                active.selection.cursor = move_word_point(
+                    active.selection.cursor,
+                    total_rows,
+                    |row| self.left.display_row(row, dims.left_cols),
+                    motion,
+                )?;
+                self.left_cursor = active.selection.cursor;
+                self.ensure_left_selection_visible(&dims, active.selection.cursor.row);
+            }
+            Focus::Right => {
+                let total_rows = self.right.term.screen_rows().len();
+                if total_rows == 0 {
+                    return Ok(());
+                }
+                active.selection.cursor = move_word_point(
+                    active.selection.cursor,
+                    total_rows,
+                    |row| Ok(self.right.term.screen_rows().get(row).cloned()),
+                    motion,
+                )?;
+            }
+        }
+        self.selection = Some(active);
+        Ok(())
+    }
+
+    fn jump_selection_file_edge(&mut self, to_end: bool) -> io::Result<()> {
+        let dims = split_dims()?;
+        let mut active = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        match active.pane {
+            Focus::Left => {
+                let total_rows = self.left.display_len(dims.left_cols)?;
+                if total_rows == 0 {
+                    return Ok(());
+                }
+                let target_row = if to_end { total_rows - 1 } else { 0 };
+                let row = self
+                    .left
+                    .display_row(target_row, dims.left_cols)?
+                    .unwrap_or_default();
+                active.selection.cursor = SelectionPoint {
+                    row: target_row,
+                    col: if row.is_empty() {
+                        0
+                    } else if to_end {
+                        last_selectable_col(&row)
+                    } else {
+                        first_selectable_col(&row)
+                    },
+                };
+                self.left_cursor = active.selection.cursor;
+                self.ensure_left_selection_visible(&dims, target_row);
+            }
+            Focus::Right => {
+                let rows = self.right.term.screen_rows();
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                let target_row = if to_end { rows.len() - 1 } else { 0 };
+                let row = rows.get(target_row).cloned().unwrap_or_default();
+                active.selection.cursor = SelectionPoint {
+                    row: target_row,
+                    col: if row.is_empty() {
+                        0
+                    } else if to_end {
+                        last_selectable_col(&row)
+                    } else {
+                        first_selectable_col(&row)
+                    },
+                };
+            }
+        }
+        self.selection = Some(active);
+        Ok(())
+    }
+
+    fn move_selection_screen_position(&mut self, target: ScreenPosition) -> io::Result<()> {
+        let dims = split_dims()?;
+        let mut active = match self.selection {
+            Some(selection) => selection,
+            None => return Ok(()),
+        };
+        match active.pane {
+            Focus::Left => {
+                let total_rows = self.left.display_len(dims.left_cols)?;
+                if total_rows == 0 {
+                    return Ok(());
+                }
+                let visible_height = ViewerCore::content_height(dims.rows);
+                let visible_end = (self.left.top + visible_height).min(total_rows);
+                if visible_end <= self.left.top {
+                    return Ok(());
+                }
+                let visible_count = visible_end - self.left.top;
+                let target_row = match target {
+                    ScreenPosition::Top => self.left.top,
+                    ScreenPosition::Middle => self.left.top + visible_count.saturating_sub(1) / 2,
+                    ScreenPosition::Bottom => visible_end - 1,
+                };
+                let row = self
+                    .left
+                    .display_row(target_row, dims.left_cols)?
+                    .unwrap_or_default();
+                active.selection.cursor = SelectionPoint {
+                    row: target_row,
+                    col: if row.is_empty() {
+                        0
+                    } else {
+                        first_selectable_col(&row)
+                    },
+                };
+                self.left_cursor = active.selection.cursor;
+            }
+            Focus::Right => {
+                let rows = self.right.term.screen_rows();
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                let target_row = match target {
+                    ScreenPosition::Top => 0,
+                    ScreenPosition::Middle => rows.len().saturating_sub(1) / 2,
+                    ScreenPosition::Bottom => rows.len() - 1,
+                };
+                let row = rows.get(target_row).cloned().unwrap_or_default();
+                active.selection.cursor = SelectionPoint {
+                    row: target_row,
+                    col: if row.is_empty() {
+                        0
+                    } else {
+                        first_selectable_col(&row)
+                    },
+                };
+            }
+        }
+        self.selection = Some(active);
+        Ok(())
+    }
+
+    fn scroll_selection_preserve_cursor(&mut self, amount: isize) -> io::Result<()> {
+        let Some(active) = self.selection else {
+            return Ok(());
+        };
+        match active.pane {
+            Focus::Left => {
+                self.scroll_left_view_preserve_cursor(amount)?;
+                if let Some(mut updated) = self.selection {
+                    updated.selection.cursor = self.left_cursor;
+                    self.selection = Some(updated);
+                }
+                Ok(())
+            }
+            Focus::Right => self.move_selection_row(amount),
+        }
+    }
+
+    fn cancel_selection(&mut self, message: Option<&str>) {
+        self.selection = None;
+        if let Some(message) = message {
+            self.left.status = message.to_string();
+        } else {
+            self.left.status.clear();
+        }
+    }
+
+    fn copy_selection(&mut self) -> io::Result<()> {
+        let dims = split_dims()?;
+        let Some(active) = self.selection else {
+            return Ok(());
+        };
+        let text = match active.pane {
+            Focus::Left => selection_text(active.selection, |row| {
+                self.left.display_row(row, dims.left_cols).ok().flatten()
+            }),
+            Focus::Right => {
+                let rows = self.right.term.screen_rows();
+                selection_text(active.selection, |row| rows.get(row).cloned())
+            }
+        };
+        match copy_to_clipboard(&text) {
+            Ok(()) => {
+                self.selection = None;
+                self.left.status = format!(
+                    "Copied {} displayed line{} from {} pane",
+                    active.selection.line_span(),
+                    if active.selection.line_span() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    match active.pane {
+                        Focus::Left => "left",
+                        Focus::Right => "right",
+                    }
+                );
+            }
+            Err(err) => {
+                self.left.status = format!("Clipboard copy failed: {}", err);
+            }
+        }
+        Ok(())
+    }
+
+    fn paste_right_from_clipboard(&mut self) {
+        match paste_from_clipboard() {
+            Ok(text) => {
+                if text.is_empty() {
+                    self.left.status = "Clipboard is empty".to_string();
+                    return;
+                }
+                if !self.right.alive {
+                    self.left.status = "Right pane is not running".to_string();
+                    return;
+                }
+                match self.right.write_input(text.as_bytes()) {
+                    Ok(()) => {
+                        self.left.status = format!(
+                            "Pasted {} byte{} into right pane",
+                            text.len(),
+                            if text.len() == 1 { "" } else { "s" }
+                        );
+                    }
+                    Err(err) => {
+                        self.left.status = format!("Paste failed: {}", err);
+                    }
+                }
+            }
+            Err(err) => {
+                self.left.status = format!("Clipboard paste failed: {}", err);
+            }
+        }
+    }
+
+    fn handle_selection_key(&mut self, key: KeyEvent) -> io::Result<()> {
+        match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => self.cancel_selection(Some("Selection cleared")),
+            KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('Y'),
+                ..
+            } => {
+                self.copy_selection()?;
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.move_selection_row(1)?,
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.scroll_selection_preserve_cursor(1)?,
+            KeyEvent {
+                code: KeyCode::Up, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_row(-1)?,
+            KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.scroll_selection_preserve_cursor(-1)?,
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_col(false)?,
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_col(true)?,
+            KeyEvent {
+                code: KeyCode::Char('w'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_word(WordMotion::ForwardStart)?,
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_word(WordMotion::ForwardEnd)?,
+            KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_word(WordMotion::BackwardStart)?,
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char(' ' | 'f'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.move_selection_row(ViewerCore::content_height(split_dims()?.rows) as isize)?,
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.move_selection_row(-(ViewerCore::content_height(split_dims()?.rows) as isize))?
+            }
+            KeyEvent {
+                code: KeyCode::Char('d'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('d'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.move_selection_row(
+                (ViewerCore::content_height(split_dims()?.rows) / 2).max(1) as isize,
+            )?,
+            KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.move_selection_row(
+                -((ViewerCore::content_height(split_dims()?.rows) / 2).max(1) as isize),
+            )?,
+            KeyEvent {
+                code: KeyCode::Char('0'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_selection_line_edge(false)?,
+            KeyEvent {
+                code: KeyCode::Char('$'),
+                ..
+            } => self.move_selection_line_edge(true)?,
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.jump_selection_file_edge(false)?,
+            KeyEvent {
+                code: KeyCode::End, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('G'),
+                ..
+            } => self.jump_selection_file_edge(true)?,
+            KeyEvent {
+                code: KeyCode::Char('H'),
+                ..
+            } => self.move_selection_screen_position(ScreenPosition::Top)?,
+            KeyEvent {
+                code: KeyCode::Char('M'),
+                ..
+            } => self.move_selection_screen_position(ScreenPosition::Middle)?,
+            KeyEvent {
+                code: KeyCode::Char('L'),
+                ..
+            } => self.move_selection_screen_position(ScreenPosition::Bottom)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn status_override_text(&self) -> Option<String> {
+        self.selection.map(|active| {
+            format!(
+                "{} {} pane  h/j/k/l move  w/e/b word  H/M/L screen  y copy  Esc cancel",
+                selection_label(active.selection.mode),
+                match active.pane {
+                    Focus::Left => "left",
+                    Focus::Right => "right",
+                }
+            )
+        })
+    }
+
     fn handle_key(&mut self, stdout: &mut io::Stdout, key: KeyEvent) -> io::Result<bool> {
-        if self.prefix_pending {
-            self.prefix_pending = false;
+        if self.switch_prefix_pending {
+            self.clear_switch_prefix();
             return match key {
                 KeyEvent {
-                    code: KeyCode::Tab, ..
-                } => {
-                    self.focus = match self.focus {
-                        Focus::Left => Focus::Right,
-                        Focus::Right => Focus::Left,
-                    };
-                    Ok(false)
-                }
-                KeyEvent {
                     code: KeyCode::Char('h'),
+                    modifiers: KeyModifiers::NONE,
                     ..
                 } => {
+                    self.selection = None;
                     self.focus = Focus::Left;
                     Ok(false)
                 }
                 KeyEvent {
                     code: KeyCode::Char('l'),
+                    modifiers: KeyModifiers::NONE,
                     ..
                 } => {
+                    self.selection = None;
                     self.focus = Focus::Right;
+                    Ok(false)
+                }
+                KeyEvent {
+                    code: KeyCode::Esc, ..
+                } => Ok(false),
+                _ => {
+                    self.left.status = "Ctrl-w h/l switches panes".to_string();
+                    Ok(false)
+                }
+            };
+        }
+
+        if self.prefix_pending {
+            self.prefix_pending = false;
+            return match key {
+                KeyEvent {
+                    code: KeyCode::Char('v'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    self.start_selection(SelectionMode::Character)?;
+                    Ok(false)
+                }
+                KeyEvent {
+                    code: KeyCode::Char('V'),
+                    ..
+                } => {
+                    self.start_selection(SelectionMode::Line)?;
+                    Ok(false)
+                }
+                KeyEvent {
+                    code: KeyCode::Char('p' | 'P'),
+                    ..
+                } => {
+                    self.paste_right_from_clipboard();
                     Ok(false)
                 }
                 KeyEvent {
@@ -656,12 +1681,29 @@ impl App {
         if matches!(
             key,
             KeyEvent {
+                code: KeyCode::Char('w'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+        ) {
+            self.switch_prefix_pending = true;
+            return Ok(false);
+        }
+
+        if matches!(
+            key,
+            KeyEvent {
                 code: KeyCode::Char('g'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             }
         ) {
             self.prefix_pending = true;
+            return Ok(false);
+        }
+
+        if self.selection.is_some() {
+            self.handle_selection_key(key)?;
             return Ok(false);
         }
 
@@ -708,15 +1750,18 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<PaneMsg>) {
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
+                    debug_log("spawn_reader: EOF");
                     let _ = tx.send(PaneMsg::Eof);
                     break;
                 }
                 Ok(count) => {
                     if tx.send(PaneMsg::Data(buf[..count].to_vec())).is_err() {
+                        debug_log("spawn_reader: receiver dropped");
                         break;
                     }
                 }
                 Err(_) => {
+                    debug_log("spawn_reader: read error");
                     let _ = tx.send(PaneMsg::Eof);
                     break;
                 }
@@ -726,7 +1771,9 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<PaneMsg>) {
 }
 
 fn spawn_logged_command(line: &str, logfile: &Path, rows: usize, cols: usize) -> io::Result<Pane> {
+    debug_log("spawn_logged_command: start");
     let pty_system = native_pty_system();
+    debug_log("spawn_logged_command: got native_pty_system");
     let pair = pty_system
         .openpty(PtySize {
             rows: rows as u16,
@@ -735,6 +1782,7 @@ fn spawn_logged_command(line: &str, logfile: &Path, rows: usize, cols: usize) ->
             pixel_height: 0,
         })
         .map_err(anyerr)?;
+    debug_log("spawn_logged_command: openpty ok");
     let mut cmd = CommandBuilder::new("script");
     cmd.arg("-q");
     cmd.arg(logfile);
@@ -743,11 +1791,16 @@ fn spawn_logged_command(line: &str, logfile: &Path, rows: usize, cols: usize) ->
     cmd.arg(line);
     cmd.cwd(env::current_dir()?);
     cmd.env("TERM", "xterm-256color");
+    debug_log("spawn_logged_command: command configured");
     let child = pair.slave.spawn_command(cmd).map_err(anyerr)?;
+    debug_log("spawn_logged_command: spawn_command ok");
     let reader = pair.master.try_clone_reader().map_err(anyerr)?;
+    debug_log("spawn_logged_command: try_clone_reader ok");
     let writer = pair.master.take_writer().map_err(anyerr)?;
+    debug_log("spawn_logged_command: take_writer ok");
     let (tx, rx) = mpsc::channel();
     spawn_reader(reader, tx);
+    debug_log("spawn_logged_command: reader thread spawned");
     Ok(Pane {
         master: pair.master,
         writer,
@@ -857,6 +1910,24 @@ fn reverse_status_cells(text: &str, width: usize) -> Vec<Cell> {
     cells
 }
 
+fn apply_cursor_highlight(row: &mut Vec<Cell>, col: usize, focused: bool) {
+    if row.is_empty() {
+        row.push(Cell::blank(Style::default()));
+    }
+    let idx = normalize_col(row, col);
+    let style = Style {
+        bg: Some(if focused { 245 } else { 240 }),
+        bold: focused,
+        dim: false,
+        reverse: false,
+        ..row[idx].style
+    };
+    row[idx].style = style;
+    if idx + 1 < row.len() && row[idx + 1].wide_cont {
+        row[idx + 1].style = style;
+    }
+}
+
 fn anyerr(err: anyhow::Error) -> io::Error {
     io::Error::other(err.to_string())
 }
@@ -864,9 +1935,18 @@ fn anyerr(err: anyhow::Error) -> io::Error {
 fn main() -> io::Result<()> {
     let args = Args::parse();
     let line = args.line.join(" ");
+    debug_log(&format!("main: starting line={line}"));
     let mut app = App::new(line)?;
     let logfile = app.logfile.clone();
     let result = app.run();
+    debug_log(&format!("main: run finished result={}", result.is_ok()));
     eprintln!("logsplit: log saved to {}", logfile.display());
     result
+}
+
+fn selection_label(mode: SelectionMode) -> &'static str {
+    match mode {
+        SelectionMode::Character => "VISUAL",
+        SelectionMode::Line => "V-LINE",
+    }
 }
