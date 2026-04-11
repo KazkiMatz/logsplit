@@ -3,9 +3,9 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use crossterm::SynchronizedUpdate;
@@ -55,6 +55,12 @@ enum PaneMsg {
     Eof,
 }
 
+#[derive(Debug)]
+enum AppEvent {
+    Terminal(Event),
+    Pane(PaneMsg),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenPosition {
     Top,
@@ -66,36 +72,32 @@ struct Pane {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send>,
-    rx: Receiver<PaneMsg>,
     term: VirtualTerminal,
     pending_utf8: Vec<u8>,
     alive: bool,
 }
 
 impl Pane {
-    fn drain(&mut self) -> bool {
-        let mut changed = false;
-        while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                PaneMsg::Data(bytes) => {
-                    let text =
-                        logsplit_rs::decode_utf8_chunk(&mut self.pending_utf8, &bytes, false);
-                    if !text.is_empty() {
-                        self.term.feed(&text);
-                        changed = true;
-                    }
-                }
-                PaneMsg::Eof => {
-                    let tail = logsplit_rs::decode_utf8_chunk(&mut self.pending_utf8, &[], true);
-                    if !tail.is_empty() {
-                        self.term.feed(&tail);
-                        changed = true;
-                    }
-                    self.alive = false;
+    fn handle_msg(&mut self, msg: PaneMsg) -> bool {
+        match msg {
+            PaneMsg::Data(bytes) => {
+                let text = logsplit_rs::decode_utf8_chunk(&mut self.pending_utf8, &bytes, false);
+                if !text.is_empty() {
+                    self.term.feed(&text);
+                    true
+                } else {
+                    false
                 }
             }
+            PaneMsg::Eof => {
+                let tail = logsplit_rs::decode_utf8_chunk(&mut self.pending_utf8, &[], true);
+                if !tail.is_empty() {
+                    self.term.feed(&tail);
+                }
+                self.alive = false;
+                !tail.is_empty()
+            }
         }
-        changed
     }
 
     fn resize(&mut self, rows: usize, cols: usize) -> io::Result<()> {
@@ -132,6 +134,8 @@ impl Pane {
 struct App {
     left: ViewerCore,
     right: Pane,
+    events_rx: Receiver<AppEvent>,
+    events_tx: Sender<AppEvent>,
     focus: Focus,
     prefix_pending: bool,
     switch_prefix_pending: bool,
@@ -162,12 +166,21 @@ impl App {
         debug_log("ViewerCore::new ok");
         left.jump_to_end(dims.rows, dims.left_cols)?;
         debug_log("left.jump_to_end ok");
-        let right = spawn_logged_command(&line, &logfile, dims.rows, dims.right_cols)?;
+        let (events_tx, events_rx) = mpsc::channel();
+        let right = spawn_logged_command(
+            &line,
+            &logfile,
+            dims.rows,
+            dims.right_cols,
+            events_tx.clone(),
+        )?;
         debug_log("spawn_logged_command ok");
 
         let mut app = Self {
             left,
             right,
+            events_rx,
+            events_tx,
             focus: Focus::Right,
             prefix_pending: false,
             switch_prefix_pending: false,
@@ -185,79 +198,125 @@ impl App {
         debug_log("about to enter TerminalGuard");
         let _guard = TerminalGuard::enter(&mut stdout)?;
         debug_log("TerminalGuard entered");
+        spawn_input_reader(self.events_tx.clone());
         let mut needs_redraw = true;
 
         loop {
-            let dims = split_dims()?;
-            let mut changed = false;
-            changed |= self.left.poll(dims.rows, dims.left_cols)?;
-            if self.left.follow {
-                self.snap_left_cursor_to_end(&dims)?;
-            } else {
-                self.normalize_left_cursor(&dims)?;
-            }
-            changed |= self.right.drain();
-
-            if self.right.exited()? {
-                debug_log("right pane exited; leaving run loop");
-                break;
-            }
-
-            if changed {
-                needs_redraw = true;
-            }
             if needs_redraw {
                 self.draw(&mut stdout)?;
                 needs_redraw = false;
             }
 
-            let has_event = match event::poll(Duration::from_millis(50)) {
-                Ok(value) => value,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => false,
-                Err(err) => return Err(err),
-            };
-            if !has_event {
-                continue;
+            let mut pending = vec![self.next_app_event()?];
+            while let Ok(app_event) = self.events_rx.try_recv() {
+                pending.push(app_event);
             }
-            let event = match event::read() {
-                Ok(value) => value,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(err) => return Err(err),
-            };
-            match event {
-                Event::Resize(_, _) => {
-                    let dims = split_dims()?;
-                    self.left.resize_source(
-                        dims.rows,
-                        dims.right_cols,
-                        dims.rows,
-                        dims.left_cols,
-                    )?;
-                    if self.left.follow {
-                        self.left.jump_to_end(dims.rows, dims.left_cols)?;
-                        self.snap_left_cursor_to_end(&dims)?;
-                    } else {
-                        self.normalize_left_cursor(&dims)?;
-                        self.ensure_left_selection_visible(&dims, self.left_cursor.row);
+
+            let mut pane_changed = false;
+            let mut saw_pane = false;
+            let mut should_break = false;
+
+            for app_event in pending {
+                match app_event {
+                    AppEvent::Pane(msg) => {
+                        pane_changed |= self.right.handle_msg(msg);
+                        saw_pane = true;
                     }
-                    self.right.resize(dims.rows, dims.right_cols)?;
-                    if self.selection.take().is_some() {
-                        self.left.status = "Selection cleared after resize".to_string();
+                    AppEvent::Terminal(event) => {
+                        if saw_pane {
+                            pane_changed |= self.sync_left_from_log()?;
+                            saw_pane = false;
+                        }
+                        if pane_changed {
+                            needs_redraw = true;
+                            pane_changed = false;
+                        }
+                        if self.handle_terminal_event(&mut stdout, event)? {
+                            should_break = true;
+                            break;
+                        }
+                        needs_redraw = true;
                     }
-                    self.previous_frame = None;
-                    needs_redraw = true;
                 }
-                Event::Key(key) => {
-                    if self.handle_key(&mut stdout, key)? {
-                        break;
-                    }
-                    needs_redraw = true;
-                }
-                _ => {}
+            }
+
+            if saw_pane {
+                pane_changed |= self.sync_left_from_log()?;
+            }
+            if pane_changed {
+                needs_redraw = true;
+            }
+
+            if should_break || self.right.exited()? {
+                debug_log("right pane exited; leaving run loop");
+                break;
             }
         }
 
         Ok(())
+    }
+
+    fn next_app_event(&self) -> io::Result<AppEvent> {
+        self.events_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "app event channel closed"))
+    }
+
+    fn sync_left_from_log(&mut self) -> io::Result<bool> {
+        let dims = split_dims()?;
+        let changed = self.left.poll(dims.rows, dims.left_cols)?;
+        if self.left.follow {
+            self.snap_left_cursor_to_end(&dims)?;
+        } else {
+            self.normalize_left_cursor(&dims)?;
+        }
+        Ok(changed)
+    }
+
+    fn handle_resize(&mut self) -> io::Result<()> {
+        let dims = split_dims()?;
+        self.left
+            .resize_source(dims.rows, dims.right_cols, dims.rows, dims.left_cols)?;
+        if self.left.follow {
+            self.left.jump_to_end(dims.rows, dims.left_cols)?;
+            self.snap_left_cursor_to_end(&dims)?;
+        } else {
+            self.normalize_left_cursor(&dims)?;
+            self.ensure_left_selection_visible(&dims, self.left_cursor.row);
+        }
+        self.right.resize(dims.rows, dims.right_cols)?;
+        if self.selection.take().is_some() {
+            self.left.status = "Selection cleared after resize".to_string();
+        }
+        self.previous_frame = None;
+        Ok(())
+    }
+
+    fn handle_terminal_event(&mut self, stdout: &mut io::Stdout, event: Event) -> io::Result<bool> {
+        match event {
+            Event::Resize(_, _) => {
+                self.handle_resize()?;
+                Ok(false)
+            }
+            Event::Key(key) => self.handle_key(stdout, key),
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_prompt_event(&mut self, app_event: AppEvent) -> io::Result<Option<KeyEvent>> {
+        match app_event {
+            AppEvent::Pane(msg) => {
+                let _ = self.right.handle_msg(msg);
+                let _ = self.sync_left_from_log()?;
+                Ok(None)
+            }
+            AppEvent::Terminal(Event::Resize(_, _)) => {
+                self.handle_resize()?;
+                Ok(None)
+            }
+            AppEvent::Terminal(Event::Key(key)) => Ok(Some(key)),
+            AppEvent::Terminal(_) => Ok(None),
+        }
     }
 
     fn draw(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
@@ -420,15 +479,11 @@ impl App {
         Ok(())
     }
 
-    fn prompt_left(
-        &mut self,
-        stdout: &mut io::Stdout,
-        prompt: &str,
-        width: usize,
-    ) -> io::Result<String> {
-        let dims = split_dims()?;
+    fn prompt_left(&mut self, stdout: &mut io::Stdout, prompt: &str) -> io::Result<String> {
         let mut buf = String::new();
         loop {
+            let dims = split_dims()?;
+            let width = dims.left_cols;
             let mut line = format!("{}{}", prompt, buf);
             let line_len = line.chars().count();
             if line_len < width {
@@ -447,8 +502,7 @@ impl App {
             )?;
             stdout.flush()?;
 
-            let event = event::read()?;
-            if let Event::Key(key) = event {
+            if let Some(key) = self.handle_prompt_event(self.next_app_event()?)? {
                 match key {
                     KeyEvent {
                         code: KeyCode::Enter,
@@ -697,7 +751,7 @@ impl App {
                 ..
             } => {
                 let dims = split_dims()?;
-                let term = self.prompt_left(stdout, "/", dims.left_cols)?;
+                let term = self.prompt_left(stdout, "/")?;
                 if !term.is_empty() {
                     self.left.search_term = Some(term.clone());
                     self.left.last_search_forward = true;
@@ -1744,25 +1798,28 @@ fn split_dims() -> io::Result<SplitDims> {
     })
 }
 
-fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<PaneMsg>) {
+fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: Sender<AppEvent>) {
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
                     debug_log("spawn_reader: EOF");
-                    let _ = tx.send(PaneMsg::Eof);
+                    let _ = tx.send(AppEvent::Pane(PaneMsg::Eof));
                     break;
                 }
                 Ok(count) => {
-                    if tx.send(PaneMsg::Data(buf[..count].to_vec())).is_err() {
+                    if tx
+                        .send(AppEvent::Pane(PaneMsg::Data(buf[..count].to_vec())))
+                        .is_err()
+                    {
                         debug_log("spawn_reader: receiver dropped");
                         break;
                     }
                 }
                 Err(_) => {
                     debug_log("spawn_reader: read error");
-                    let _ = tx.send(PaneMsg::Eof);
+                    let _ = tx.send(AppEvent::Pane(PaneMsg::Eof));
                     break;
                 }
             }
@@ -1770,7 +1827,33 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<PaneMsg>) {
     });
 }
 
-fn spawn_logged_command(line: &str, logfile: &Path, rows: usize, cols: usize) -> io::Result<Pane> {
+fn spawn_input_reader(tx: Sender<AppEvent>) {
+    thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(event @ Event::Key(_)) | Ok(event @ Event::Resize(_, _)) => {
+                    if tx.send(AppEvent::Terminal(event)).is_err() {
+                        debug_log("spawn_input_reader: receiver dropped");
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    debug_log(&format!("spawn_input_reader: read error: {err}"));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_logged_command(
+    line: &str,
+    logfile: &Path,
+    rows: usize,
+    cols: usize,
+    tx: Sender<AppEvent>,
+) -> io::Result<Pane> {
     debug_log("spawn_logged_command: start");
     let pty_system = native_pty_system();
     debug_log("spawn_logged_command: got native_pty_system");
@@ -1798,14 +1881,12 @@ fn spawn_logged_command(line: &str, logfile: &Path, rows: usize, cols: usize) ->
     debug_log("spawn_logged_command: try_clone_reader ok");
     let writer = pair.master.take_writer().map_err(anyerr)?;
     debug_log("spawn_logged_command: take_writer ok");
-    let (tx, rx) = mpsc::channel();
     spawn_reader(reader, tx);
     debug_log("spawn_logged_command: reader thread spawned");
     Ok(Pane {
         master: pair.master,
         writer,
         child,
-        rx,
         term: VirtualTerminal::new(rows, cols),
         pending_utf8: Vec::new(),
         alive: true,

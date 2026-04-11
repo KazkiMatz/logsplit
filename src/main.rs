@@ -1,7 +1,10 @@
 use std::cmp::max;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use crossterm::SynchronizedUpdate;
@@ -50,9 +53,23 @@ struct ViewportDims {
     content_width: usize,
 }
 
+#[derive(Debug)]
+enum ViewerEvent {
+    Terminal(Event),
+    FileChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
 struct ViewerApp {
     args: Args,
     viewer: ViewerCore,
+    events_rx: Receiver<ViewerEvent>,
+    events_tx: Sender<ViewerEvent>,
     selection: Option<Selection>,
     needs_redraw: bool,
     previous_frame: Option<FrameSnapshot>,
@@ -67,12 +84,16 @@ impl ViewerApp {
             dims.source_cols,
             args.follow,
         )?;
+        let (events_tx, events_rx) = mpsc::channel();
+        spawn_file_watcher(args.path.clone(), events_tx.clone());
         if viewer.follow {
             viewer.jump_to_end(dims.height as usize, dims.content_width)?;
         }
         Ok(Self {
             args,
             viewer,
+            events_rx,
+            events_tx,
             selection: None,
             needs_redraw: true,
             previous_frame: None,
@@ -277,9 +298,9 @@ impl ViewerApp {
     }
 
     fn prompt(&mut self, stdout: &mut io::Stdout, prompt: &str) -> io::Result<String> {
-        let dims = self.viewport_dims()?;
         let mut buf = String::new();
         loop {
+            let dims = self.viewport_dims()?;
             let line = format!("{}{}", prompt, buf);
             queue!(
                 stdout,
@@ -292,8 +313,7 @@ impl ViewerApp {
             )?;
             stdout.flush()?;
 
-            let event = event::read()?;
-            if let Event::Key(key) = event {
+            if let Some(key) = self.handle_prompt_event(self.next_viewer_event()?)? {
                 match key {
                     KeyEvent {
                         code: KeyCode::Enter,
@@ -328,6 +348,47 @@ impl ViewerApp {
         self.invalidate_frame();
         self.mark_dirty();
         Ok(buf)
+    }
+
+    fn next_viewer_event(&self) -> io::Result<ViewerEvent> {
+        self.events_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "viewer event channel closed"))
+    }
+
+    fn poll_viewer_change(&mut self) -> io::Result<bool> {
+        let dims = self.viewport_dims()?;
+        self.viewer.poll(dims.height as usize, dims.content_width)
+    }
+
+    fn handle_terminal_event(&mut self, stdout: &mut io::Stdout, event: Event) -> io::Result<bool> {
+        match event {
+            Event::Resize(_, _) => {
+                let dims = self.viewport_dims()?;
+                self.reload_for_viewport(dims)?;
+                Ok(false)
+            }
+            Event::Key(key) => self.handle_key(stdout, key),
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_prompt_event(&mut self, event: ViewerEvent) -> io::Result<Option<KeyEvent>> {
+        match event {
+            ViewerEvent::Terminal(Event::Resize(_, _)) => {
+                let dims = self.viewport_dims()?;
+                self.reload_for_viewport(dims)?;
+                Ok(None)
+            }
+            ViewerEvent::Terminal(Event::Key(key)) => Ok(Some(key)),
+            ViewerEvent::Terminal(_) => Ok(None),
+            ViewerEvent::FileChanged => {
+                if self.poll_viewer_change()? {
+                    self.mark_dirty();
+                }
+                Ok(None)
+            }
+        }
     }
 
     fn show_help(&mut self) {
@@ -909,35 +970,90 @@ impl ViewerApp {
     fn run(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
         let _guard = TerminalGuard::enter(&mut stdout)?;
+        spawn_input_reader(self.events_tx.clone());
 
         loop {
-            let dims = self.viewport_dims()?;
-            let changed = self.viewer.poll(dims.height as usize, dims.content_width)?;
-            if changed {
-                self.mark_dirty();
-            }
             if self.needs_redraw {
                 self.draw(&mut stdout)?;
                 self.needs_redraw = false;
             }
-            if !event::poll(Duration::from_millis(200))? {
-                continue;
+
+            let mut pending = vec![self.next_viewer_event()?];
+            while let Ok(event) = self.events_rx.try_recv() {
+                pending.push(event);
             }
-            match event::read()? {
-                Event::Resize(_, _) => {
-                    let dims = self.viewport_dims()?;
-                    self.reload_for_viewport(dims)?;
-                }
-                Event::Key(key) => {
-                    if self.handle_key(&mut stdout, key)? {
-                        break;
+
+            let mut file_changed = false;
+            let mut should_break = false;
+            for event in pending {
+                match event {
+                    ViewerEvent::FileChanged => {
+                        file_changed = true;
+                    }
+                    ViewerEvent::Terminal(event) => {
+                        if file_changed {
+                            if self.poll_viewer_change()? {
+                                self.mark_dirty();
+                            }
+                            file_changed = false;
+                        }
+                        if self.handle_terminal_event(&mut stdout, event)? {
+                            should_break = true;
+                            break;
+                        }
+                        self.mark_dirty();
                     }
                 }
-                _ => {}
+            }
+            if file_changed && self.poll_viewer_change()? {
+                self.mark_dirty();
+            }
+            if should_break {
+                break;
             }
         }
         Ok(())
     }
+}
+
+fn current_file_signature(path: &Path) -> Option<FileSignature> {
+    let meta = fs::metadata(path).ok()?;
+    Some(FileSignature {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
+}
+
+fn spawn_input_reader(tx: Sender<ViewerEvent>) {
+    thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(event @ Event::Key(_)) | Ok(event @ Event::Resize(_, _)) => {
+                    if tx.send(ViewerEvent::Terminal(event)).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn spawn_file_watcher(path: PathBuf, tx: Sender<ViewerEvent>) {
+    thread::spawn(move || {
+        let mut signature = current_file_signature(&path);
+        loop {
+            thread::sleep(Duration::from_millis(20));
+            let next = current_file_signature(&path);
+            if next != signature {
+                signature = next;
+                if tx.send(ViewerEvent::FileChanged).is_err() {
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn dump_render(path: &Path, rows: usize, cols: usize, tail: Option<usize>) -> io::Result<()> {
