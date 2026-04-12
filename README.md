@@ -16,7 +16,7 @@ This repository builds two binaries:
 ## What It Does
 
 - Spawns your command in a PTY on the right side.
-- Records the raw terminal transcript with `script(1)`.
+- Records the raw terminal transcript directly from the PTY stream.
 - Replays that transcript into a virtual terminal for the left-side viewer.
 - Lets you scroll, search, copy, and inspect the log independently from the live terminal.
 - Preserves the caller's current working directory for the spawned command.
@@ -255,9 +255,9 @@ Quit:
 
 ## Notes
 
-- `logsplit` launches the child command via `script -q <logfile> /bin/zsh -lc <line>`.
+- `logsplit` launches the child command directly as `/bin/zsh -lc <line>` inside a PTY and writes the PTY output into the logfile itself.
 - The left-side viewer reconstructs terminal state by replaying escape sequences, so it is useful even for redraw-heavy CLI programs.
-- The project is currently oriented toward Unix-like systems with `script(1)` available.
+- The project is currently oriented toward Unix-like systems with PTY support and `/bin/zsh` available.
 
 ## Repository Layout
 

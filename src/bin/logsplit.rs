@@ -23,7 +23,7 @@ use logsplit_rs::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 #[derive(Debug, Parser)]
-#[command(about = "Run a command with live script logging and a side-by-side log viewer")]
+#[command(about = "Run a command with live PTY logging and a side-by-side log viewer")]
 struct Args {
     #[arg(required = true, trailing_var_arg = true)]
     line: Vec<String>,
@@ -1798,7 +1798,7 @@ fn split_dims() -> io::Result<SplitDims> {
     })
 }
 
-fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: Sender<AppEvent>) {
+fn spawn_reader(mut reader: Box<dyn Read + Send>, mut logfile: File, tx: Sender<AppEvent>) {
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         loop {
@@ -1809,6 +1809,9 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: Sender<AppEvent>) {
                     break;
                 }
                 Ok(count) => {
+                    if let Err(err) = logfile.write_all(&buf[..count]) {
+                        debug_log(&format!("spawn_reader: logfile write error: {err}"));
+                    }
                     if tx
                         .send(AppEvent::Pane(PaneMsg::Data(buf[..count].to_vec())))
                         .is_err()
@@ -1866,14 +1869,12 @@ fn spawn_logged_command(
         })
         .map_err(anyerr)?;
     debug_log("spawn_logged_command: openpty ok");
-    let mut cmd = CommandBuilder::new("script");
-    cmd.arg("-q");
-    cmd.arg(logfile);
-    cmd.arg("/bin/zsh");
+    let mut cmd = CommandBuilder::new("/bin/zsh");
     cmd.arg("-lc");
     cmd.arg(line);
     cmd.cwd(env::current_dir()?);
     cmd.env("TERM", "xterm-256color");
+    cmd.env("SCRIPT", logfile.as_os_str());
     debug_log("spawn_logged_command: command configured");
     let child = pair.slave.spawn_command(cmd).map_err(anyerr)?;
     debug_log("spawn_logged_command: spawn_command ok");
@@ -1881,7 +1882,8 @@ fn spawn_logged_command(
     debug_log("spawn_logged_command: try_clone_reader ok");
     let writer = pair.master.take_writer().map_err(anyerr)?;
     debug_log("spawn_logged_command: take_writer ok");
-    spawn_reader(reader, tx);
+    let logfile_writer = File::options().append(true).open(logfile)?;
+    spawn_reader(reader, logfile_writer, tx);
     debug_log("spawn_logged_command: reader thread spawned");
     Ok(Pane {
         master: pair.master,
