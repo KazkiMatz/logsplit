@@ -544,7 +544,7 @@ impl App {
     }
 
     fn show_left_help(&mut self) {
-        self.left.status = "h/j/k/l move cursor, w/e/b words, C-n and arrows move, C-e/C-y scroll view, space/f/C-f page down, C-b page up, d/u half-page, 0/$ line, g/G file, H/M/L screen, / search, n/N repeat, v/V visual select, Ctrl-w h/l switch pane, p paste to right, ? help, Ctrl-g v/V/p/q extra actions".to_string();
+        self.left.status = "h/j/k/l move cursor, w/e/b words, C-n and arrows move, C-e/C-y scroll view, space/f/C-f page down, C-b page up, d/u half-page, 0/$ line, g/G file, H/M/L screen, / search, n/N repeat, v/V visual select, Ctrl-w h/l switch pane (Ctrl-h/Ctrl-l also work), p paste to right, ? help, Ctrl-g v/V/p/q extra actions".to_string();
     }
 
     fn handle_left_key(&mut self, stdout: &mut io::Stdout, key: KeyEvent) -> io::Result<()> {
@@ -1676,20 +1676,12 @@ impl App {
         if self.switch_prefix_pending {
             self.clear_switch_prefix();
             return match key {
-                KeyEvent {
-                    code: KeyCode::Char('h'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
+                key if is_switch_left_key(key) => {
                     self.selection = None;
                     self.focus = Focus::Left;
                     Ok(false)
                 }
-                KeyEvent {
-                    code: KeyCode::Char('l'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
+                key if is_switch_right_key(key) => {
                     self.selection = None;
                     self.focus = Focus::Right;
                     Ok(false)
@@ -1698,7 +1690,8 @@ impl App {
                     code: KeyCode::Esc, ..
                 } => Ok(false),
                 _ => {
-                    self.left.status = "Ctrl-w h/l switches panes".to_string();
+                    self.left.status =
+                        "Ctrl-w h/l switches panes (Ctrl-h/Ctrl-l also work)".to_string();
                     Ok(false)
                 }
             };
@@ -2022,6 +2015,37 @@ fn anyerr(err: anyhow::Error) -> io::Error {
     io::Error::other(err.to_string())
 }
 
+fn is_switch_left_key(key: KeyEvent) -> bool {
+    matches!(
+        key,
+        KeyEvent {
+            code: KeyCode::Char('h'),
+            modifiers: KeyModifiers::NONE | KeyModifiers::CONTROL,
+            ..
+        } | KeyEvent {
+            code: KeyCode::Left,
+            ..
+        } | KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        }
+    )
+}
+
+fn is_switch_right_key(key: KeyEvent) -> bool {
+    matches!(
+        key,
+        KeyEvent {
+            code: KeyCode::Char('l'),
+            modifiers: KeyModifiers::NONE | KeyModifiers::CONTROL,
+            ..
+        } | KeyEvent {
+            code: KeyCode::Right,
+            ..
+        }
+    )
+}
+
 fn resolve_shell_path(args_shell: Option<&Path>) -> PathBuf {
     resolve_shell_path_from(
         args_shell,
@@ -2072,7 +2096,8 @@ fn selection_label(mode: SelectionMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_shell_path_from;
+    use super::{is_switch_left_key, is_switch_right_key, resolve_shell_path_from};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
@@ -2106,5 +2131,41 @@ mod tests {
     fn resolve_shell_falls_back_to_bin_sh() {
         let shell = resolve_shell_path_from(None, None, None);
         assert_eq!(shell, PathBuf::from("/bin/sh"));
+    }
+
+    #[test]
+    fn switch_left_accepts_plain_and_control_h_variants() {
+        assert!(is_switch_left_key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_switch_left_key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_switch_left_key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE
+        )));
+        assert!(is_switch_left_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn switch_right_accepts_plain_and_control_l_variants() {
+        assert!(is_switch_right_key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_switch_right_key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_switch_right_key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE
+        )));
     }
 }
