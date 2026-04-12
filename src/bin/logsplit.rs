@@ -1,5 +1,6 @@
 use std::cmp::max;
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,9 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 #[derive(Debug, Parser)]
 #[command(about = "Run a command with live PTY logging and a side-by-side log viewer")]
 struct Args {
+    #[arg(long, value_name = "PATH")]
+    shell: Option<PathBuf>,
+
     #[arg(required = true, trailing_var_arg = true)]
     line: Vec<String>,
 }
@@ -146,8 +150,8 @@ struct App {
 }
 
 impl App {
-    fn new(line: String) -> io::Result<Self> {
-        debug_log(&format!("App::new line={line}"));
+    fn new(line: String, shell: PathBuf) -> io::Result<Self> {
+        debug_log(&format!("App::new line={line} shell={}", shell.display()));
         let dims = split_dims()?;
         debug_log(&format!(
             "split_dims rows={} left_cols={} right_cols={}",
@@ -169,6 +173,7 @@ impl App {
         let (events_tx, events_rx) = mpsc::channel();
         let right = spawn_logged_command(
             &line,
+            &shell,
             &logfile,
             dims.rows,
             dims.right_cols,
@@ -1852,6 +1857,7 @@ fn spawn_input_reader(tx: Sender<AppEvent>) {
 
 fn spawn_logged_command(
     line: &str,
+    shell: &Path,
     logfile: &Path,
     rows: usize,
     cols: usize,
@@ -1869,7 +1875,8 @@ fn spawn_logged_command(
         })
         .map_err(anyerr)?;
     debug_log("spawn_logged_command: openpty ok");
-    let mut cmd = CommandBuilder::new("/bin/zsh");
+    let shell_program = shell.to_string_lossy().into_owned();
+    let mut cmd = CommandBuilder::new(&shell_program);
     cmd.arg("-lc");
     cmd.arg(line);
     cmd.cwd(env::current_dir()?);
@@ -2015,11 +2022,40 @@ fn anyerr(err: anyhow::Error) -> io::Error {
     io::Error::other(err.to_string())
 }
 
+fn resolve_shell_path(args_shell: Option<&Path>) -> PathBuf {
+    resolve_shell_path_from(
+        args_shell,
+        env::var_os("LOGSPLIT_SHELL").as_deref(),
+        env::var_os("SHELL").as_deref(),
+    )
+}
+
+fn resolve_shell_path_from(
+    args_shell: Option<&Path>,
+    logsplit_shell: Option<&OsStr>,
+    shell: Option<&OsStr>,
+) -> PathBuf {
+    if let Some(path) = args_shell.filter(|path| !path.as_os_str().is_empty()) {
+        return path.to_path_buf();
+    }
+    if let Some(value) = logsplit_shell.filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
+    }
+    if let Some(value) = shell.filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
+    }
+    PathBuf::from("/bin/sh")
+}
+
 fn main() -> io::Result<()> {
     let args = Args::parse();
+    let shell = resolve_shell_path(args.shell.as_deref());
     let line = args.line.join(" ");
-    debug_log(&format!("main: starting line={line}"));
-    let mut app = App::new(line)?;
+    debug_log(&format!(
+        "main: starting line={line} shell={}",
+        shell.display()
+    ));
+    let mut app = App::new(line, shell)?;
     let logfile = app.logfile.clone();
     let result = app.run();
     debug_log(&format!("main: run finished result={}", result.is_ok()));
@@ -2031,5 +2067,44 @@ fn selection_label(mode: SelectionMode) -> &'static str {
     match mode {
         SelectionMode::Character => "VISUAL",
         SelectionMode::Line => "V-LINE",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_shell_path_from;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolve_shell_prefers_explicit_arg() {
+        let shell = resolve_shell_path_from(
+            Some(Path::new("/bin/bash")),
+            Some(OsStr::new("/bin/fish")),
+            Some(OsStr::new("/bin/zsh")),
+        );
+        assert_eq!(shell, PathBuf::from("/bin/bash"));
+    }
+
+    #[test]
+    fn resolve_shell_prefers_logsplit_env_over_shell_env() {
+        let shell = resolve_shell_path_from(
+            None,
+            Some(OsStr::new("/bin/fish")),
+            Some(OsStr::new("/bin/zsh")),
+        );
+        assert_eq!(shell, PathBuf::from("/bin/fish"));
+    }
+
+    #[test]
+    fn resolve_shell_uses_shell_env_when_override_missing() {
+        let shell = resolve_shell_path_from(None, None, Some(OsStr::new("/bin/zsh")));
+        assert_eq!(shell, PathBuf::from("/bin/zsh"));
+    }
+
+    #[test]
+    fn resolve_shell_falls_back_to_bin_sh() {
+        let shell = resolve_shell_path_from(None, None, None);
+        assert_eq!(shell, PathBuf::from("/bin/sh"));
     }
 }

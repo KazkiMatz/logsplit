@@ -48,6 +48,7 @@ Any shell command line works:
 target/release/logsplit htop
 target/release/logsplit python manage.py shell
 target/release/logsplit tail -f /var/log/system.log
+target/release/logsplit --shell /bin/bash "source env.sh && claude --resume"
 ```
 
 Open an existing logfile directly in the standalone viewer:
@@ -255,9 +256,10 @@ Quit:
 
 ## Notes
 
-- `logsplit` launches the child command directly as `/bin/zsh -lc <line>` inside a PTY and writes the PTY output into the logfile itself.
+- `logsplit` launches the child command as `<shell> -lc <line>` inside a PTY and writes the PTY output into the logfile itself.
+- Shell selection order is: `--shell`, then `LOGSPLIT_SHELL`, then `$SHELL`, then `/bin/sh`.
 - The left-side viewer reconstructs terminal state by replaying escape sequences, so it is useful even for redraw-heavy CLI programs.
-- The project is currently oriented toward Unix-like systems with PTY support and `/bin/zsh` available.
+- The project is currently oriented toward Unix-like systems with PTY support and a shell that accepts `-lc`.
 
 ## Repository Layout
 
