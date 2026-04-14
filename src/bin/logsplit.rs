@@ -1873,7 +1873,6 @@ fn spawn_logged_command(
     cmd.arg("-lc");
     cmd.arg(line);
     cmd.cwd(env::current_dir()?);
-    cmd.env("TERM", "xterm-256color");
     cmd.env("SCRIPT", logfile.as_os_str());
     debug_log("spawn_logged_command: command configured");
     let child = pair.slave.spawn_command(cmd).map_err(anyerr)?;
