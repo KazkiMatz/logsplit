@@ -119,6 +119,10 @@ impl VirtualTerminal {
         self.history.len()
     }
 
+    pub fn history_rows(&self) -> &[Vec<Cell>] {
+        &self.history
+    }
+
     pub fn screen_rows(&self) -> &[Vec<Cell>] {
         &self.screen
     }
@@ -128,16 +132,17 @@ impl VirtualTerminal {
     }
 
     pub fn rendered_rows(&self) -> Vec<Vec<Cell>> {
-        let mut rows = self.history.clone();
+        let mut rows = Vec::with_capacity(self.history.len() + self.screen.len());
+        rows.extend(self.history.iter().cloned());
         rows.extend(self.trimmed_screen_rows());
         rows
     }
 
     pub fn rendered_lines(&self) -> Vec<String> {
-        self.rendered_rows()
-            .into_iter()
-            .map(|row| row_to_text(&row))
-            .collect()
+        let mut lines = Vec::with_capacity(self.history.len() + self.screen.len());
+        lines.extend(self.history.iter().map(|row| row_to_text(row)));
+        lines.extend(self.screen.iter().map(|row| row_to_text(row)));
+        lines
     }
 
     fn feed_char(&mut self, ch: char) {

@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use crossterm::SynchronizedUpdate;
@@ -18,8 +18,9 @@ use crossterm::terminal;
 use logsplit_rs::{
     Cell, Selection, SelectionMode, SelectionPoint, Style, TerminalGuard, ViewerCore,
     VirtualTerminal, WordMotion, apply_selection_highlight, clear_segment, copy_to_clipboard,
-    debug_log, draw_cells, first_selectable_col, last_selectable_col, move_word_point, next_col,
-    normalize_col, overlay_cells, paste_from_clipboard, previous_col, row_to_text, selection_text,
+    debug_log, debug_timing, draw_cells, first_selectable_col, last_selectable_col,
+    move_word_point, next_col, normalize_col, overlay_cells, paste_from_clipboard, previous_col,
+    row_to_text, selection_text,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -325,12 +326,27 @@ impl App {
     }
 
     fn draw(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
+        let total_start = Instant::now();
         let dims = split_dims()?;
+        let build_start = Instant::now();
         let frame = self.build_frame(&dims)?;
+        debug_timing("App::draw.build_frame", build_start, || {
+            format!(
+                "rows={} cols={} left_top={} right_cols={}",
+                dims.rows, frame.width, self.left.top, dims.right_cols
+            )
+        });
+        let sync_start = Instant::now();
         stdout.sync_update(|stdout| -> io::Result<()> {
             self.draw_frame_diff(stdout, &frame)?;
             Ok(())
         })??;
+        debug_timing("App::draw.sync_update", sync_start, || {
+            format!("rows={} cols={}", frame.height, frame.width)
+        });
+        debug_timing("App::draw.total", total_start, || {
+            format!("rows={} cols={}", frame.height, frame.width)
+        });
         self.previous_frame = Some(frame);
         Ok(())
     }

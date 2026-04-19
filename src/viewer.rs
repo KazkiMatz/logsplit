@@ -2,7 +2,9 @@ use std::cmp::{max, min};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use crate::debug::debug_timing;
 use crate::terminal::{
     Cell, VirtualTerminal, clamp, clamp_signed, decode_utf8_chunk, wrap_styled_line,
 };
@@ -24,17 +26,20 @@ impl ReplayFile {
     }
 
     pub fn replay_all(&mut self, term: &mut VirtualTerminal) -> io::Result<()> {
+        let start = Instant::now();
         term.reset(false);
         self.offset = 0;
         self.pending_utf8.clear();
 
         let mut fh = File::open(&self.path)?;
         let mut buf = [0u8; 65536];
+        let mut chunk_count = 0usize;
         loop {
             let count = fh.read(&mut buf)?;
             if count == 0 {
                 break;
             }
+            chunk_count += 1;
             self.offset += count as u64;
             let text = decode_utf8_chunk(&mut self.pending_utf8, &buf[..count], false);
             term.feed(&text);
@@ -43,10 +48,20 @@ impl ReplayFile {
         if !remainder.is_empty() {
             term.feed(&remainder);
         }
+        debug_timing("ReplayFile::replay_all", start, || {
+            format!(
+                "path={} bytes={} chunks={} history_rows={}",
+                self.path.display(),
+                self.offset,
+                chunk_count,
+                term.history_len()
+            )
+        });
         Ok(())
     }
 
     pub fn poll(&mut self, term: &mut VirtualTerminal) -> io::Result<bool> {
+        let start = Instant::now();
         let size = fs::metadata(&self.path)?.len();
         if size < self.offset {
             self.replay_all(term)?;
@@ -61,15 +76,31 @@ impl ReplayFile {
 
         let mut changed = false;
         let mut buf = [0u8; 65536];
+        let mut bytes_read = 0usize;
+        let mut chunk_count = 0usize;
         loop {
             let count = fh.read(&mut buf)?;
             if count == 0 {
                 break;
             }
             changed = true;
+            bytes_read += count;
+            chunk_count += 1;
             self.offset += count as u64;
             let text = decode_utf8_chunk(&mut self.pending_utf8, &buf[..count], false);
             term.feed(&text);
+        }
+        if changed {
+            debug_timing("ReplayFile::poll", start, || {
+                format!(
+                    "path={} bytes={} chunks={} offset={} history_rows={}",
+                    self.path.display(),
+                    bytes_read,
+                    chunk_count,
+                    self.offset,
+                    term.history_len()
+                )
+            });
         }
         Ok(changed)
     }
@@ -196,6 +227,7 @@ impl ViewerCore {
     ) -> io::Result<Vec<Vec<Cell>>> {
         let content_height = Self::content_height(total_rows);
         self.ensure_layout(content_width)?;
+        let start = Instant::now();
         let cache = self
             .layout_cache
             .as_ref()
@@ -213,6 +245,17 @@ impl ViewerCore {
                 rows.push(Vec::new());
             }
         }
+        let visible_count = visible.len();
+        debug_timing("ViewerCore::visible_rows", start, || {
+            format!(
+                "path={} top={} height={} visible={} display={}",
+                self.path.display(),
+                self.top,
+                content_height,
+                visible_count,
+                cache.display.len()
+            )
+        });
         Ok(rows)
     }
 
@@ -413,6 +456,7 @@ impl ViewerCore {
     }
 
     fn ensure_layout(&mut self, content_width: usize) -> io::Result<()> {
+        let start = Instant::now();
         let content_width = max(content_width, 1);
         let current_history_count = self.term.history_len();
 
@@ -426,7 +470,9 @@ impl ViewerCore {
         }
 
         let screen_rows = self.term.trimmed_screen_rows();
-        let (display, first_display_by_logical) = if let Some(cache) = &self.layout_cache {
+        let screen_row_count = screen_rows.len();
+
+        if let Some(cache) = self.layout_cache.as_mut() {
             if cache.content_width == content_width && cache.history_count <= current_history_count
             {
                 let cached_history_count = cache.history_count;
@@ -434,47 +480,72 @@ impl ViewerCore {
                     .first_display_by_logical
                     .get(cached_history_count)
                     .copied()
-                    .unwrap_or_else(|| cache.display.len());
-                let mut display = cache.display[..prefix_display_count].to_vec();
-                let mut first = cache.first_display_by_logical[..cached_history_count].to_vec();
+                    .unwrap_or(cache.display.len());
+                cache.display.truncate(prefix_display_count);
+                cache
+                    .first_display_by_logical
+                    .truncate(cached_history_count);
 
-                for (idx, row) in self
+                let target_logical_rows = current_history_count + screen_row_count;
+                cache.first_display_by_logical.reserve(
+                    target_logical_rows.saturating_sub(cache.first_display_by_logical.len()),
+                );
+
+                for (offset, row) in self
                     .term
-                    .rendered_rows()
-                    .into_iter()
-                    .enumerate()
+                    .history_rows()
+                    .iter()
                     .skip(cached_history_count)
-                    .take(current_history_count.saturating_sub(cached_history_count))
+                    .enumerate()
                 {
-                    first.push(display.len());
-                    for segment in wrap_styled_line(&row, content_width) {
-                        display.push((idx, segment));
-                    }
+                    let logical_idx = cached_history_count + offset;
+                    append_wrapped_row(
+                        &mut cache.display,
+                        &mut cache.first_display_by_logical,
+                        logical_idx,
+                        row,
+                        content_width,
+                    );
                 }
 
                 for (offset, row) in screen_rows.iter().enumerate() {
                     let logical_idx = current_history_count + offset;
-                    first.push(display.len());
-                    for segment in wrap_styled_line(row, content_width) {
-                        display.push((logical_idx, segment));
-                    }
+                    append_wrapped_row(
+                        &mut cache.display,
+                        &mut cache.first_display_by_logical,
+                        logical_idx,
+                        row,
+                        content_width,
+                    );
                 }
 
-                (display, first)
-            } else {
-                full_layout(
-                    &self.term.rendered_rows()[..current_history_count],
-                    &screen_rows,
-                    content_width,
-                )
+                cache.content_width = content_width;
+                cache.history_count = current_history_count;
+                self.layout_stale = false;
+                let display_len = cache.display.len();
+                debug_timing("ViewerCore::ensure_layout", start, || {
+                    format!(
+                        "path={} mode={} width={} history_rows={} screen_rows={} display_rows={}",
+                        self.path.display(),
+                        "append-in-place",
+                        content_width,
+                        current_history_count,
+                        screen_row_count,
+                        display_len
+                    )
+                });
+                return Ok(());
             }
+        }
+
+        let mode = if self.layout_cache.is_some() {
+            "full-rebuild"
         } else {
-            full_layout(
-                &self.term.rendered_rows()[..current_history_count],
-                &screen_rows,
-                content_width,
-            )
+            "full-initial"
         };
+        let (display, first_display_by_logical) =
+            full_layout(self.term.history_rows(), &screen_rows, content_width);
+        let display_len = display.len();
 
         self.layout_cache = Some(LayoutCache {
             content_width,
@@ -483,7 +554,31 @@ impl ViewerCore {
             first_display_by_logical,
         });
         self.layout_stale = false;
+        debug_timing("ViewerCore::ensure_layout", start, || {
+            format!(
+                "path={} mode={} width={} history_rows={} screen_rows={} display_rows={}",
+                self.path.display(),
+                mode,
+                content_width,
+                current_history_count,
+                screen_row_count,
+                display_len
+            )
+        });
         Ok(())
+    }
+}
+
+fn append_wrapped_row(
+    display: &mut Vec<(usize, Vec<Cell>)>,
+    first_display_by_logical: &mut Vec<usize>,
+    logical_idx: usize,
+    row: &[Cell],
+    content_width: usize,
+) {
+    first_display_by_logical.push(display.len());
+    for segment in wrap_styled_line(row, content_width) {
+        display.push((logical_idx, segment));
     }
 }
 
@@ -492,18 +587,26 @@ fn full_layout(
     screen_rows: &[Vec<Cell>],
     content_width: usize,
 ) -> (Vec<(usize, Vec<Cell>)>, Vec<usize>) {
-    let logical = history_rows
-        .iter()
-        .cloned()
-        .chain(screen_rows.iter().cloned())
-        .collect::<Vec<_>>();
     let mut display = Vec::new();
-    let mut first_display_by_logical = Vec::new();
-    for (idx, row) in logical.iter().enumerate() {
-        first_display_by_logical.push(display.len());
-        for segment in wrap_styled_line(row, content_width) {
-            display.push((idx, segment));
-        }
+    let mut first_display_by_logical = Vec::with_capacity(history_rows.len() + screen_rows.len());
+    for (idx, row) in history_rows.iter().enumerate() {
+        append_wrapped_row(
+            &mut display,
+            &mut first_display_by_logical,
+            idx,
+            row,
+            content_width,
+        );
+    }
+    for (offset, row) in screen_rows.iter().enumerate() {
+        let logical_idx = history_rows.len() + offset;
+        append_wrapped_row(
+            &mut display,
+            &mut first_display_by_logical,
+            logical_idx,
+            row,
+            content_width,
+        );
     }
     (display, first_display_by_logical)
 }

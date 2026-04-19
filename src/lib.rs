@@ -7,7 +7,7 @@ pub mod ui;
 pub mod viewer;
 
 pub use clipboard::{copy_to_clipboard, paste_from_clipboard};
-pub use debug::debug_log;
+pub use debug::{debug_log, debug_timing};
 pub use render::{
     apply_style, cell_prefix_width, clear_segment, common_prefix_len, draw_cells, overlay_cells,
 };
