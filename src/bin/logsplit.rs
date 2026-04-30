@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,11 +17,11 @@ use crossterm::queue;
 use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
 use crossterm::terminal;
 use logsplit_rs::{
-    Cell, Selection, SelectionMode, SelectionPoint, Style, TerminalGuard, ViewerCore,
-    VirtualTerminal, WordMotion, apply_selection_highlight, clear_segment, copy_to_clipboard,
-    debug_log, debug_timing, draw_cells, first_selectable_col, last_selectable_col,
-    move_word_point, next_col, normalize_col, overlay_cells, paste_from_clipboard, previous_col,
-    row_to_text, selection_text,
+    Cell, Selection, SelectionMode, SelectionPoint, Style, TerminalGuard, TranscriptRecorder,
+    ViewerCore, VirtualTerminal, WordMotion, apply_selection_highlight, clear_segment,
+    copy_to_clipboard, debug_log, debug_timing, draw_cells, first_selectable_col,
+    last_selectable_col, move_word_point, next_col, normalize_col, overlay_cells,
+    paste_from_clipboard, previous_col, row_to_text, selection_text,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -56,8 +57,15 @@ struct ActiveSelection {
 
 #[derive(Debug)]
 enum PaneMsg {
-    Data(Vec<u8>),
+    Data(PaneChunk),
     Eof,
+}
+
+#[derive(Debug)]
+struct PaneChunk {
+    bytes: Vec<u8>,
+    sync_active_after: bool,
+    sync_frame_finished: bool,
 }
 
 #[derive(Debug)]
@@ -75,18 +83,26 @@ enum ScreenPosition {
 
 struct Pane {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send>,
     term: VirtualTerminal,
     pending_utf8: Vec<u8>,
     alive: bool,
+    transcript: Arc<Mutex<TranscriptRecorder>>,
+    sync_active: bool,
+    sync_frame_finished: bool,
 }
 
 impl Pane {
     fn handle_msg(&mut self, msg: PaneMsg) -> bool {
         match msg {
-            PaneMsg::Data(bytes) => {
-                let text = logsplit_rs::decode_utf8_chunk(&mut self.pending_utf8, &bytes, false);
+            PaneMsg::Data(chunk) => {
+                self.sync_active = chunk.sync_active_after;
+                if chunk.sync_frame_finished {
+                    self.sync_frame_finished = true;
+                }
+                let text =
+                    logsplit_rs::decode_utf8_chunk(&mut self.pending_utf8, &chunk.bytes, false);
                 if !text.is_empty() {
                     self.term.feed(&text);
                     true
@@ -113,13 +129,20 @@ impl Pane {
             pixel_height: 0,
         };
         self.master.resize(size).map_err(anyerr)?;
+        if let Err(err) = self.record_resize(rows, cols) {
+            debug_log(&format!("Pane::resize record_resize error: {err}"));
+        }
         self.term.resize(rows, cols);
         Ok(())
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        writer.write_all(bytes)?;
+        writer.flush()
     }
 
     fn exited(&mut self) -> io::Result<bool> {
@@ -133,6 +156,91 @@ impl Pane {
             Err(err) => return Err(err),
         }
         Ok(!self.alive)
+    }
+
+    fn record_resize(&self, rows: usize, cols: usize) -> io::Result<()> {
+        self.transcript
+            .lock()
+            .map_err(|err| io::Error::other(err.to_string()))?
+            .record_resize(rows, cols)
+    }
+
+    fn redraw_ready(&mut self, changed: bool) -> bool {
+        let sync_frame_finished = std::mem::take(&mut self.sync_frame_finished);
+        !self.sync_active && (changed || sync_frame_finished)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ProtocolState {
+    #[default]
+    Normal,
+    Esc,
+    Csi,
+}
+
+#[derive(Debug, Default)]
+struct TerminalProtocol {
+    state: ProtocolState,
+    csi: Vec<u8>,
+    sync_active: bool,
+}
+
+#[derive(Debug, Default)]
+struct ProtocolUpdate {
+    replies: Vec<Vec<u8>>,
+    sync_active_after: bool,
+    sync_frame_finished: bool,
+}
+
+impl TerminalProtocol {
+    fn process(&mut self, bytes: &[u8]) -> ProtocolUpdate {
+        let mut update = ProtocolUpdate {
+            replies: Vec::new(),
+            sync_active_after: self.sync_active,
+            sync_frame_finished: false,
+        };
+        for &byte in bytes {
+            match self.state {
+                ProtocolState::Normal => {
+                    if byte == 0x1b {
+                        self.state = ProtocolState::Esc;
+                    }
+                }
+                ProtocolState::Esc => {
+                    if byte == b'[' {
+                        self.csi.clear();
+                        self.state = ProtocolState::Csi;
+                    } else {
+                        self.state = ProtocolState::Normal;
+                    }
+                }
+                ProtocolState::Csi => {
+                    self.csi.push(byte);
+                    if (0x40..=0x7e).contains(&byte) {
+                        match self.csi.as_slice() {
+                            b"?2026$p" => update.replies.push(b"\x1b[?2026;2$y".to_vec()),
+                            b"c" => update.replies.push(b"\x1b[?62;c".to_vec()),
+                            b">q" | b">0q" => {
+                                update.replies.push(b"\x1bP>|XTerm(401)\x1b\\".to_vec())
+                            }
+                            b"?2026h" => self.sync_active = true,
+                            b"?2026l" => {
+                                if self.sync_active {
+                                    update.sync_frame_finished = true;
+                                }
+                                self.sync_active = false;
+                            }
+                            _ => {}
+                        }
+                        update.sync_active_after = self.sync_active;
+                        self.csi.clear();
+                        self.state = ProtocolState::Normal;
+                    }
+                }
+            }
+        }
+        update
     }
 }
 
@@ -225,12 +333,14 @@ impl App {
             for app_event in pending {
                 match app_event {
                     AppEvent::Pane(msg) => {
-                        pane_changed |= self.right.handle_msg(msg);
+                        let changed = self.right.handle_msg(msg);
+                        pane_changed |= self.right.redraw_ready(changed);
                         saw_pane = true;
                     }
                     AppEvent::Terminal(event) => {
                         if saw_pane {
-                            pane_changed |= self.sync_left_from_log()?;
+                            let left_changed = self.sync_left_from_log()?;
+                            pane_changed |= self.right.redraw_ready(left_changed);
                             saw_pane = false;
                         }
                         if pane_changed {
@@ -247,7 +357,8 @@ impl App {
             }
 
             if saw_pane {
-                pane_changed |= self.sync_left_from_log()?;
+                let left_changed = self.sync_left_from_log()?;
+                pane_changed |= self.right.redraw_ready(left_changed);
             }
             if pane_changed {
                 needs_redraw = true;
@@ -1812,9 +1923,15 @@ fn split_dims() -> io::Result<SplitDims> {
     })
 }
 
-fn spawn_reader(mut reader: Box<dyn Read + Send>, mut logfile: File, tx: Sender<AppEvent>) {
+fn spawn_reader(
+    mut reader: Box<dyn Read + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    transcript: Arc<Mutex<TranscriptRecorder>>,
+    tx: Sender<AppEvent>,
+) {
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
+        let mut protocol = TerminalProtocol::default();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
@@ -1823,11 +1940,32 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, mut logfile: File, tx: Sender<
                     break;
                 }
                 Ok(count) => {
-                    if let Err(err) = logfile.write_all(&buf[..count]) {
+                    let update = protocol.process(&buf[..count]);
+                    for reply in update.replies {
+                        let write_result = writer
+                            .lock()
+                            .map_err(|err| io::Error::other(err.to_string()))
+                            .and_then(|mut writer| {
+                                writer.write_all(&reply)?;
+                                writer.flush()
+                            });
+                        if let Err(err) = write_result {
+                            debug_log(&format!("spawn_reader: reply write error: {err}"));
+                        }
+                    }
+                    let write_result = transcript
+                        .lock()
+                        .map_err(|err| io::Error::other(err.to_string()))
+                        .and_then(|mut recorder| recorder.append_bytes(&buf[..count]));
+                    if let Err(err) = write_result {
                         debug_log(&format!("spawn_reader: logfile write error: {err}"));
                     }
                     if tx
-                        .send(AppEvent::Pane(PaneMsg::Data(buf[..count].to_vec())))
+                        .send(AppEvent::Pane(PaneMsg::Data(PaneChunk {
+                            bytes: buf[..count].to_vec(),
+                            sync_active_after: update.sync_active_after,
+                            sync_frame_finished: update.sync_frame_finished,
+                        })))
                         .is_err()
                     {
                         debug_log("spawn_reader: receiver dropped");
@@ -1895,10 +2033,10 @@ fn spawn_logged_command(
     debug_log("spawn_logged_command: spawn_command ok");
     let reader = pair.master.try_clone_reader().map_err(anyerr)?;
     debug_log("spawn_logged_command: try_clone_reader ok");
-    let writer = pair.master.take_writer().map_err(anyerr)?;
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(anyerr)?));
     debug_log("spawn_logged_command: take_writer ok");
-    let logfile_writer = File::options().append(true).open(logfile)?;
-    spawn_reader(reader, logfile_writer, tx);
+    let transcript = Arc::new(Mutex::new(TranscriptRecorder::create(logfile, rows, cols)?));
+    spawn_reader(reader, writer.clone(), transcript.clone(), tx);
     debug_log("spawn_logged_command: reader thread spawned");
     Ok(Pane {
         master: pair.master,
@@ -1907,6 +2045,9 @@ fn spawn_logged_command(
         term: VirtualTerminal::new(rows, cols),
         pending_utf8: Vec::new(),
         alive: true,
+        transcript,
+        sync_active: false,
+        sync_frame_finished: false,
     })
 }
 
@@ -2111,7 +2252,9 @@ fn selection_label(mode: SelectionMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_switch_left_key, is_switch_right_key, resolve_shell_path_from};
+    use super::{
+        TerminalProtocol, is_switch_left_key, is_switch_right_key, resolve_shell_path_from,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -2182,5 +2325,38 @@ mod tests {
             KeyCode::Right,
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn terminal_protocol_replies_to_sync_mode_query() {
+        let mut protocol = TerminalProtocol::default();
+        let update = protocol.process(b"\x1b[?2026$p");
+
+        assert_eq!(update.replies, vec![b"\x1b[?2026;2$y".to_vec()]);
+        assert!(!update.sync_active_after);
+        assert!(!update.sync_frame_finished);
+    }
+
+    #[test]
+    fn terminal_protocol_replies_to_xtversion_query() {
+        let mut protocol = TerminalProtocol::default();
+        let update = protocol.process(b"\x1b[>0q");
+
+        assert_eq!(update.replies, vec![b"\x1bP>|XTerm(401)\x1b\\".to_vec()]);
+        assert!(!update.sync_active_after);
+        assert!(!update.sync_frame_finished);
+    }
+
+    #[test]
+    fn terminal_protocol_tracks_sync_frame_boundaries() {
+        let mut protocol = TerminalProtocol::default();
+
+        let start = protocol.process(b"\x1b[?2026h");
+        assert!(start.sync_active_after);
+        assert!(!start.sync_frame_finished);
+
+        let end = protocol.process(b"\x1b[?2026l");
+        assert!(!end.sync_active_after);
+        assert!(end.sync_frame_finished);
     }
 }
