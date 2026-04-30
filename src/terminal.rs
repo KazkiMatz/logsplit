@@ -53,6 +53,7 @@ pub struct VirtualTerminal {
     screen: Vec<Vec<Cell>>,
     cursor: Cursor,
     saved_cursor: Cursor,
+    wrap_pending: bool,
     state: ParseState,
     csi: String,
     esc_other: String,
@@ -70,6 +71,7 @@ impl VirtualTerminal {
             screen: Vec::new(),
             cursor: Cursor::default(),
             saved_cursor: Cursor::default(),
+            wrap_pending: false,
             state: ParseState::Normal,
             csi: String::new(),
             esc_other: String::new(),
@@ -88,6 +90,7 @@ impl VirtualTerminal {
         self.screen = (0..self.rows).map(|_| self.blank_row()).collect();
         self.cursor = Cursor::default();
         self.saved_cursor = Cursor::default();
+        self.wrap_pending = false;
         self.state = ParseState::Normal;
         self.csi.clear();
         self.esc_other.clear();
@@ -95,10 +98,52 @@ impl VirtualTerminal {
         self.osc_escape = false;
     }
 
-    pub fn resize(&mut self, rows: usize, cols: usize) {
+    pub fn reset_to_size(&mut self, rows: usize, cols: usize) {
         self.rows = max(rows, 1);
         self.cols = max(cols, 1);
         self.reset(false);
+    }
+
+    pub fn resize(&mut self, rows: usize, cols: usize) {
+        let new_rows = max(rows, 1);
+        let new_cols = max(cols, 1);
+
+        if self.rows == new_rows && self.cols == new_cols {
+            return;
+        }
+
+        for row in &mut self.history {
+            normalize_row_width(row, new_cols, Style::default());
+        }
+        for row in &mut self.screen {
+            normalize_row_width(row, new_cols, self.current_style);
+        }
+
+        if self.screen.len() > new_rows {
+            let remove_count = self.screen.len() - new_rows;
+            let removed = self.screen.drain(0..remove_count).collect::<Vec<_>>();
+            self.history
+                .extend(removed.into_iter().map(|row| trim_row(&row)));
+        }
+
+        self.rows = new_rows;
+        self.cols = new_cols;
+
+        while self.screen.len() < self.rows {
+            self.screen.push(self.blank_row());
+        }
+
+        self.cursor.row = min(self.cursor.row, self.rows.saturating_sub(1));
+        self.saved_cursor.row = min(self.saved_cursor.row, self.rows.saturating_sub(1));
+        let max_col = self.cols.saturating_sub(1);
+        let logical_cursor_col = if self.wrap_pending {
+            self.cursor.col.saturating_add(1)
+        } else {
+            self.cursor.col
+        };
+        self.cursor.col = min(logical_cursor_col, max_col);
+        self.saved_cursor.col = min(self.saved_cursor.col, max_col);
+        self.wrap_pending = false;
     }
 
     pub fn feed(&mut self, text: &str) {
@@ -160,10 +205,20 @@ impl VirtualTerminal {
         let ord = ch as u32;
         match ch {
             '\x1b' => self.state = ParseState::Esc,
-            '\r' => self.cursor.col = 0,
-            '\n' => self.linefeed(),
-            '\x08' => self.cursor.col = self.cursor.col.saturating_sub(1),
+            '\r' => {
+                self.cancel_wrap_pending();
+                self.cursor.col = 0;
+            }
+            '\n' => {
+                self.cancel_wrap_pending();
+                self.linefeed();
+            }
+            '\x08' => {
+                self.cancel_wrap_pending();
+                self.cursor.col = self.cursor.col.saturating_sub(1);
+            }
             '\t' => {
+                self.cancel_wrap_pending();
                 let next_tab = ((self.cursor.col / 8) + 1) * 8;
                 self.cursor.col = min(next_tab, self.cols.saturating_sub(1));
             }
@@ -190,6 +245,7 @@ impl VirtualTerminal {
                 self.state = ParseState::Normal;
             }
             '8' => {
+                self.cancel_wrap_pending();
                 self.cursor = self.saved_cursor;
                 self.state = ParseState::Normal;
             }
@@ -198,15 +254,18 @@ impl VirtualTerminal {
                 self.state = ParseState::Normal;
             }
             'D' => {
+                self.cancel_wrap_pending();
                 self.linefeed();
                 self.state = ParseState::Normal;
             }
             'E' => {
+                self.cancel_wrap_pending();
                 self.cursor.col = 0;
                 self.linefeed();
                 self.state = ParseState::Normal;
             }
             'M' => {
+                self.cancel_wrap_pending();
                 self.reverse_index();
                 self.state = ParseState::Normal;
             }
@@ -272,6 +331,10 @@ impl VirtualTerminal {
         } else {
             body.split(';').map(parse_param).collect::<Vec<_>>()
         };
+
+        if should_cancel_wrap(final_char) {
+            self.cancel_wrap_pending();
+        }
 
         match final_char {
             'A' => self.cursor.row = self.cursor.row.saturating_sub(param(&params, 0, 1)),
@@ -395,13 +458,17 @@ impl VirtualTerminal {
     }
 
     fn put_char(&mut self, ch: char) {
-        if self.cursor.col >= self.cols {
-            self.cursor.col = 0;
+        if self.wrap_pending {
             self.linefeed();
+            self.cursor.col = 0;
+            self.wrap_pending = false;
         }
         let width = max(char_width(ch), 1);
         if width > self.cols {
             return;
+        }
+        if self.cursor.col >= self.cols {
+            self.cursor.col = self.cols.saturating_sub(1);
         }
         if width == 2 && self.cursor.col + width > self.cols {
             self.cursor.col = 0;
@@ -423,9 +490,13 @@ impl VirtualTerminal {
                 wide_cont: true,
             };
         }
-        self.cursor.col += width;
-        if self.cursor.col >= self.cols {
-            self.cursor.col = self.cols;
+        let next_col = self.cursor.col + width;
+        if next_col >= self.cols {
+            self.cursor.col = self.cols.saturating_sub(1);
+            self.wrap_pending = true;
+        } else {
+            self.cursor.col = next_col;
+            self.wrap_pending = false;
         }
     }
 
@@ -559,6 +630,13 @@ impl VirtualTerminal {
             *cell = Cell::blank(self.current_style);
         }
     }
+
+    fn cancel_wrap_pending(&mut self) {
+        if self.wrap_pending {
+            self.wrap_pending = false;
+            self.cursor.col = min(self.cursor.col, self.cols.saturating_sub(1));
+        }
+    }
 }
 
 pub fn clamp(value: usize, lower: usize, upper: usize) -> usize {
@@ -669,6 +747,24 @@ pub fn decode_utf8_chunk(pending: &mut Vec<u8>, bytes: &[u8], final_flush: bool)
     out
 }
 
+fn normalize_row_width(row: &mut Vec<Cell>, cols: usize, blank_style: Style) {
+    if row.len() > cols {
+        row.truncate(cols);
+    } else if row.len() < cols {
+        row.resize(cols, Cell::blank(blank_style));
+    }
+
+    if row.is_empty() {
+        return;
+    }
+
+    let last_idx = row.len() - 1;
+    let last = row[last_idx];
+    if last.wide_cont || (!last.wide_cont && char_width(last.ch) > 1) {
+        row[last_idx] = Cell::blank(blank_style);
+    }
+}
+
 fn valid_csi(seq: &str) -> bool {
     if seq.is_empty() {
         return false;
@@ -708,6 +804,31 @@ fn parse_sgr_int(value: &str) -> Option<u16> {
     }
 }
 
+fn should_cancel_wrap(final_char: char) -> bool {
+    matches!(
+        final_char,
+        'A' | 'B'
+            | 'C'
+            | 'D'
+            | 'E'
+            | 'F'
+            | 'G'
+            | 'H'
+            | 'f'
+            | 'J'
+            | 'K'
+            | 'L'
+            | 'M'
+            | '@'
+            | 'P'
+            | 'X'
+            | 'S'
+            | 'T'
+            | 's'
+            | 'u'
+    )
+}
+
 fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
     if r == g && g == b {
         if r < 8 {
@@ -721,4 +842,35 @@ fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
     16 + 36 * ((r as f32 / 255.0) * 5.0).round() as u8
         + 6 * ((g as f32 / 255.0) * 5.0).round() as u8
         + ((b as f32 / 255.0) * 5.0).round() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VirtualTerminal;
+
+    #[test]
+    fn resize_preserves_existing_row_content() {
+        let mut term = VirtualTerminal::new(1, 3);
+        term.feed("abc");
+        term.resize(1, 6);
+        term.feed("def");
+
+        assert_eq!(term.rendered_lines(), vec!["abcdef"]);
+    }
+
+    #[test]
+    fn cursor_motion_after_last_column_cancels_wrap_pending() {
+        let mut term = VirtualTerminal::new(2, 5);
+        term.feed("abcde\x1b[AZ");
+
+        assert_eq!(term.rendered_lines(), vec!["abcdZ", ""]);
+    }
+
+    #[test]
+    fn sgr_after_last_column_keeps_wrap_pending() {
+        let mut term = VirtualTerminal::new(2, 5);
+        term.feed("abcde\x1b[31mZ");
+
+        assert_eq!(term.rendered_lines(), vec!["abcde", "Z"]);
+    }
 }

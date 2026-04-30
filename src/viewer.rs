@@ -2,34 +2,59 @@ use std::cmp::{max, min};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crate::debug::debug_timing;
 use crate::terminal::{
     Cell, VirtualTerminal, clamp, clamp_signed, decode_utf8_chunk, wrap_styled_line,
 };
+use crate::transcript::{ResizeEvent, load_resize_events, resize_events_path};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn current_file_signature(path: &Path) -> Option<FileSignature> {
+    let meta = fs::metadata(path).ok()?;
+    Some(FileSignature {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
+}
 
 #[derive(Debug)]
 pub struct ReplayFile {
     path: PathBuf,
+    resize_path: PathBuf,
     offset: u64,
     pending_utf8: Vec<u8>,
+    resize_events: Vec<ResizeEvent>,
+    next_resize_index: usize,
+    resize_signature: Option<FileSignature>,
 }
 
 impl ReplayFile {
     pub fn new(path: PathBuf) -> Self {
+        let resize_path = resize_events_path(&path);
         Self {
             path,
+            resize_path,
             offset: 0,
             pending_utf8: Vec::new(),
+            resize_events: Vec::new(),
+            next_resize_index: 0,
+            resize_signature: None,
         }
     }
 
     pub fn replay_all(&mut self, term: &mut VirtualTerminal) -> io::Result<()> {
         let start = Instant::now();
-        term.reset(false);
         self.offset = 0;
         self.pending_utf8.clear();
+        self.reload_resize_events()?;
+        self.reset_term_for_replay(term);
 
         let mut fh = File::open(&self.path)?;
         let mut buf = [0u8; 65536];
@@ -40,21 +65,21 @@ impl ReplayFile {
                 break;
             }
             chunk_count += 1;
-            self.offset += count as u64;
-            let text = decode_utf8_chunk(&mut self.pending_utf8, &buf[..count], false);
-            term.feed(&text);
+            self.feed_bytes(term, &buf[..count]);
         }
         let remainder = decode_utf8_chunk(&mut self.pending_utf8, &[], true);
         if !remainder.is_empty() {
             term.feed(&remainder);
         }
+        self.apply_resize_events_at_current_offset(term);
         debug_timing("ReplayFile::replay_all", start, || {
             format!(
-                "path={} bytes={} chunks={} history_rows={}",
+                "path={} bytes={} chunks={} history_rows={} resize_events={}",
                 self.path.display(),
                 self.offset,
                 chunk_count,
-                term.history_len()
+                term.history_len(),
+                self.resize_events.len()
             )
         });
         Ok(())
@@ -62,6 +87,12 @@ impl ReplayFile {
 
     pub fn poll(&mut self, term: &mut VirtualTerminal) -> io::Result<bool> {
         let start = Instant::now();
+        let resize_signature = current_file_signature(&self.resize_path);
+        if resize_signature != self.resize_signature {
+            self.replay_all(term)?;
+            return Ok(true);
+        }
+
         let size = fs::metadata(&self.path)?.len();
         if size < self.offset {
             self.replay_all(term)?;
@@ -86,23 +117,86 @@ impl ReplayFile {
             changed = true;
             bytes_read += count;
             chunk_count += 1;
-            self.offset += count as u64;
-            let text = decode_utf8_chunk(&mut self.pending_utf8, &buf[..count], false);
-            term.feed(&text);
+            self.feed_bytes(term, &buf[..count]);
         }
+        self.apply_resize_events_at_current_offset(term);
         if changed {
             debug_timing("ReplayFile::poll", start, || {
                 format!(
-                    "path={} bytes={} chunks={} offset={} history_rows={}",
+                    "path={} bytes={} chunks={} offset={} history_rows={} resize_events={}",
                     self.path.display(),
                     bytes_read,
                     chunk_count,
                     self.offset,
-                    term.history_len()
+                    term.history_len(),
+                    self.resize_events.len()
                 )
             });
         }
         Ok(changed)
+    }
+
+    fn reload_resize_events(&mut self) -> io::Result<()> {
+        self.resize_events = load_resize_events(&self.path)?;
+        self.next_resize_index = 0;
+        self.resize_signature = current_file_signature(&self.resize_path);
+        Ok(())
+    }
+
+    fn reset_term_for_replay(&mut self, term: &mut VirtualTerminal) {
+        let mut initial_rows = term.rows();
+        let mut initial_cols = term.cols();
+        while let Some(event) = self.resize_events.get(self.next_resize_index).copied() {
+            if event.offset != 0 {
+                break;
+            }
+            initial_rows = event.rows;
+            initial_cols = event.cols;
+            self.next_resize_index += 1;
+        }
+
+        term.reset_to_size(initial_rows, initial_cols);
+    }
+
+    fn feed_bytes(&mut self, term: &mut VirtualTerminal, bytes: &[u8]) {
+        self.apply_resize_events_at_current_offset(term);
+        let mut start = 0usize;
+        while start < bytes.len() {
+            let mut end = bytes.len();
+            if let Some(event) = self.resize_events.get(self.next_resize_index) {
+                if event.offset > self.offset {
+                    let delta = (event.offset - self.offset) as usize;
+                    if delta < end - start {
+                        end = start + delta;
+                    }
+                }
+            }
+
+            if end == start {
+                self.apply_resize_events_at_current_offset(term);
+                continue;
+            }
+
+            let text = decode_utf8_chunk(&mut self.pending_utf8, &bytes[start..end], false);
+            if !text.is_empty() {
+                term.feed(&text);
+            }
+            self.offset += (end - start) as u64;
+            start = end;
+            self.apply_resize_events_at_current_offset(term);
+        }
+    }
+
+    fn apply_resize_events_at_current_offset(&mut self, term: &mut VirtualTerminal) {
+        while let Some(event) = self.resize_events.get(self.next_resize_index).copied() {
+            if event.offset > self.offset {
+                break;
+            }
+            if term.rows() != event.rows || term.cols() != event.cols {
+                term.resize(event.rows, event.cols);
+            }
+            self.next_resize_index += 1;
+        }
     }
 }
 
@@ -609,4 +703,39 @@ fn full_layout(
         );
     }
     (display, first_display_by_logical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReplayFile;
+    use crate::terminal::VirtualTerminal;
+    use crate::transcript::resize_events_path;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_log_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!("logsplit-viewer-test-{name}-{nonce}.log"));
+        path
+    }
+
+    #[test]
+    fn replay_applies_resize_history_by_byte_offset() {
+        let path = temp_log_path("resize-replay");
+        fs::write(&path, b"abcdef").unwrap();
+        fs::write(resize_events_path(&path), b"0\t1\t3\n3\t1\t6\n").unwrap();
+
+        let mut term = VirtualTerminal::new(10, 10);
+        let mut replay = ReplayFile::new(path.clone());
+        replay.replay_all(&mut term).unwrap();
+
+        assert_eq!(term.rendered_lines(), vec!["abcdef"]);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(resize_events_path(&path));
+    }
 }

@@ -3,6 +3,7 @@ pub mod debug;
 pub mod render;
 pub mod selection;
 pub mod terminal;
+pub mod transcript;
 pub mod ui;
 pub mod viewer;
 
@@ -20,5 +21,6 @@ pub use terminal::{
     Cell, Style, VirtualTerminal, char_width, clamp, clamp_signed, decode_utf8_chunk, row_to_text,
     trim_row, wrap_styled_line,
 };
+pub use transcript::{ResizeEvent, TranscriptRecorder, load_resize_events, resize_events_path};
 pub use ui::TerminalGuard;
 pub use viewer::{ReplayFile, ViewerCore};

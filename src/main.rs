@@ -17,7 +17,7 @@ use logsplit_rs::{
     Cell, ReplayFile, Selection, SelectionMode, SelectionPoint, TerminalGuard, ViewerCore,
     VirtualTerminal, apply_selection_highlight, cell_prefix_width, common_prefix_len,
     copy_to_clipboard, draw_cells, first_selectable_col, last_selectable_col, next_col,
-    normalize_col, previous_col, selection_text,
+    normalize_col, previous_col, resize_events_path, selection_text,
 };
 
 #[derive(Debug, Parser, Clone)]
@@ -1042,10 +1042,17 @@ fn spawn_input_reader(tx: Sender<ViewerEvent>) {
 
 fn spawn_file_watcher(path: PathBuf, tx: Sender<ViewerEvent>) {
     thread::spawn(move || {
-        let mut signature = current_file_signature(&path);
+        let resize_path = resize_events_path(&path);
+        let mut signature = (
+            current_file_signature(&path),
+            current_file_signature(&resize_path),
+        );
         loop {
             thread::sleep(Duration::from_millis(20));
-            let next = current_file_signature(&path);
+            let next = (
+                current_file_signature(&path),
+                current_file_signature(&resize_path),
+            );
             if next != signature {
                 signature = next;
                 if tx.send(ViewerEvent::FileChanged).is_err() {
