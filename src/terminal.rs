@@ -59,6 +59,8 @@ pub struct VirtualTerminal {
     esc_other: String,
     osc: String,
     osc_escape: bool,
+    sync_active: bool,
+    line_dirty_min_col: Option<usize>,
 }
 
 impl VirtualTerminal {
@@ -77,6 +79,8 @@ impl VirtualTerminal {
             esc_other: String::new(),
             osc: String::new(),
             osc_escape: false,
+            sync_active: false,
+            line_dirty_min_col: None,
         };
         term.reset(false);
         term
@@ -96,6 +100,8 @@ impl VirtualTerminal {
         self.esc_other.clear();
         self.osc.clear();
         self.osc_escape = false;
+        self.sync_active = false;
+        self.line_dirty_min_col = None;
     }
 
     pub fn reset_to_size(&mut self, rows: usize, cols: usize) {
@@ -144,6 +150,7 @@ impl VirtualTerminal {
         self.cursor.col = min(logical_cursor_col, max_col);
         self.saved_cursor.col = min(self.saved_cursor.col, max_col);
         self.wrap_pending = false;
+        self.line_dirty_min_col = None;
     }
 
     pub fn feed(&mut self, text: &str) {
@@ -337,7 +344,7 @@ impl VirtualTerminal {
         }
 
         match final_char {
-            'A' => self.cursor.row = self.cursor.row.saturating_sub(param(&params, 0, 1)),
+            'A' => self.cursor_up(param(&params, 0, 1)),
             'B' => self.cursor_down(param(&params, 0, 1), false),
             'C' => {
                 self.cursor.col = min(
@@ -351,7 +358,7 @@ impl VirtualTerminal {
                 self.cursor.col = 0;
             }
             'F' => {
-                self.cursor.row = self.cursor.row.saturating_sub(param(&params, 0, 1));
+                self.cursor_up(param(&params, 0, 1));
                 self.cursor.col = 0;
             }
             'G' => {
@@ -361,6 +368,7 @@ impl VirtualTerminal {
             'H' | 'f' => {
                 let row = param(&params, 0, 1).max(1) - 1;
                 let col = param(&params, 1, 1).max(1) - 1;
+                self.clear_line_dirty_if_row_changes(row);
                 self.cursor.row = min(self.rows.saturating_sub(1), row);
                 self.cursor.col = min(self.cols.saturating_sub(1), col);
             }
@@ -376,6 +384,9 @@ impl VirtualTerminal {
             'm' => self.handle_sgr(body),
             's' => self.saved_cursor = self.cursor,
             'u' => self.cursor = self.saved_cursor,
+            'h' | 'l' if private == '?' && params.iter().any(|param| *param == Some(2026)) => {
+                self.sync_active = final_char == 'h';
+            }
             'h' | 'l' => {}
             'n' if private == '?' => {}
             _ => {}
@@ -477,6 +488,7 @@ impl VirtualTerminal {
         if self.cursor.row >= self.rows {
             self.cursor.row = self.rows.saturating_sub(1);
         }
+        self.mark_line_dirty(self.cursor.col);
         let row = &mut self.screen[self.cursor.row];
         row[self.cursor.col] = Cell {
             ch,
@@ -503,12 +515,16 @@ impl VirtualTerminal {
     fn linefeed(&mut self) {
         if self.cursor.row + 1 < self.rows {
             self.cursor.row += 1;
+        } else if self.should_use_sync_status_scroll_region() {
+            self.scroll_sync_status_area_up();
         } else {
             self.scroll_up(1);
         }
+        self.line_dirty_min_col = None;
     }
 
     fn reverse_index(&mut self) {
+        self.line_dirty_min_col = None;
         if self.cursor.row > 0 {
             self.cursor.row -= 1;
         } else {
@@ -516,7 +532,17 @@ impl VirtualTerminal {
         }
     }
 
+    fn cursor_up(&mut self, amount: usize) {
+        if amount > 0 {
+            self.line_dirty_min_col = None;
+        }
+        self.cursor.row = self.cursor.row.saturating_sub(amount);
+    }
+
     fn cursor_down(&mut self, amount: usize, keep_col: bool) {
+        if amount > 0 {
+            self.line_dirty_min_col = None;
+        }
         self.cursor.row = min(self.rows.saturating_sub(1), self.cursor.row + amount);
         if !keep_col {
             self.cursor.col = min(self.cursor.col, self.cols.saturating_sub(1));
@@ -542,7 +568,26 @@ impl VirtualTerminal {
         }
     }
 
+    fn scroll_sync_status_area_up(&mut self) {
+        // Claude's synchronized bottom-right status updates can issue LF from
+        // the bottom row while expecting only the status area to move.
+        let start = self.rows.saturating_sub(3);
+        if start + 1 >= self.rows {
+            return;
+        }
+        for row in start..self.rows - 1 {
+            self.screen[row] = self.screen[row + 1].clone();
+        }
+        self.screen[self.rows - 1] = self.blank_row();
+    }
+
     fn erase_in_line(&mut self, mode: usize) {
+        let dirty_col = match mode {
+            0 => self.cursor.col,
+            1 | 2 => 0,
+            _ => 0,
+        };
+        self.mark_line_dirty(dirty_col);
         let row = &mut self.screen[self.cursor.row];
         match mode {
             0 => {
@@ -591,6 +636,7 @@ impl VirtualTerminal {
     }
 
     fn insert_lines(&mut self, amount: usize) {
+        self.line_dirty_min_col = None;
         let amount = min(amount, self.rows.saturating_sub(self.cursor.row));
         for _ in 0..amount {
             self.screen.insert(self.cursor.row, self.blank_row());
@@ -599,6 +645,7 @@ impl VirtualTerminal {
     }
 
     fn delete_lines(&mut self, amount: usize) {
+        self.line_dirty_min_col = None;
         let amount = min(amount, self.rows.saturating_sub(self.cursor.row));
         for _ in 0..amount {
             self.screen.remove(self.cursor.row);
@@ -607,6 +654,7 @@ impl VirtualTerminal {
     }
 
     fn insert_chars(&mut self, amount: usize) {
+        self.mark_line_dirty(self.cursor.col);
         let row = &mut self.screen[self.cursor.row];
         for _ in 0..amount {
             row.insert(self.cursor.col, Cell::blank(self.current_style));
@@ -615,6 +663,7 @@ impl VirtualTerminal {
     }
 
     fn delete_chars(&mut self, amount: usize) {
+        self.mark_line_dirty(self.cursor.col);
         let row = &mut self.screen[self.cursor.row];
         let amount = min(amount, self.cols.saturating_sub(self.cursor.col));
         for _ in 0..amount {
@@ -624,6 +673,7 @@ impl VirtualTerminal {
     }
 
     fn erase_chars(&mut self, amount: usize) {
+        self.mark_line_dirty(self.cursor.col);
         let end = min(self.cols, self.cursor.col + amount);
         let row = &mut self.screen[self.cursor.row];
         for cell in row.iter_mut().take(end).skip(self.cursor.col) {
@@ -636,6 +686,26 @@ impl VirtualTerminal {
             self.wrap_pending = false;
             self.cursor.col = min(self.cursor.col, self.cols.saturating_sub(1));
         }
+    }
+
+    fn mark_line_dirty(&mut self, col: usize) {
+        self.line_dirty_min_col = Some(
+            self.line_dirty_min_col
+                .map_or(col, |current| min(current, col)),
+        );
+    }
+
+    fn clear_line_dirty_if_row_changes(&mut self, row: usize) {
+        if row != self.cursor.row {
+            self.line_dirty_min_col = None;
+        }
+    }
+
+    fn should_use_sync_status_scroll_region(&self) -> bool {
+        let Some(min_col) = self.line_dirty_min_col else {
+            return false;
+        };
+        self.sync_active && self.cursor.row + 1 >= self.rows && min_col >= self.cols / 2
     }
 }
 
@@ -872,5 +942,23 @@ mod tests {
         term.feed("abcde\x1b[31mZ");
 
         assert_eq!(term.rendered_lines(), vec!["abcde", "Z"]);
+    }
+
+    #[test]
+    fn synchronized_right_status_scroll_does_not_shift_main_content() {
+        let mut term = VirtualTerminal::new(6, 20);
+        term.feed("\x1b[1;1Htop");
+        term.feed("\x1b[4;1Hseparator");
+        term.feed("\x1b[5;1Haccept");
+        term.feed("\x1b[3;3H");
+        term.feed(
+            "\x1b[?2026h\x1b[3B\r\x1b[10C\x1b[1Acheck\r\r\n\
+             \x1b[10Cnew\r\r\n\x1b[2C\x1b[4A\x1b[?2026l",
+        );
+
+        let lines = term.rendered_lines();
+        assert_eq!(lines[0], "top");
+        assert_eq!(lines[3], "accept    check");
+        assert_eq!(lines[4], "          new");
     }
 }
