@@ -569,8 +569,9 @@ impl VirtualTerminal {
     }
 
     fn scroll_sync_status_area_up(&mut self) {
-        // Claude's synchronized bottom-right status updates can issue LF from
-        // the bottom row while expecting only the status area to move.
+        // Some XTerm(401)-style TUIs update prompt/status chrome with sparse
+        // synchronized writes from the bottom row, then redraw main content as
+        // if only the prompt/status chrome scrolled.
         let start = self.rows.saturating_sub(3);
         if start + 1 >= self.rows {
             return;
@@ -960,5 +961,24 @@ mod tests {
         assert_eq!(lines[0], "top");
         assert_eq!(lines[3], "accept    check");
         assert_eq!(lines[4], "          new");
+    }
+
+    #[test]
+    fn synchronized_status_scroll_keeps_later_sparse_redraw_aligned() {
+        let mut term = VirtualTerminal::new(6, 40);
+        term.feed("\x1b[2;1Hmain preserved");
+        term.feed("\x1b[4;1Hseparator");
+        term.feed("\x1b[5;1Haccept edits");
+        term.feed("\x1b[3;3H");
+
+        term.feed(
+            "\x1b[?2026h\x1b[3B\r\x1b[20C\x1b[1Achecking\r\r\n\
+             \x1b[20Cnew task\r\r\n\x1b[2C\x1b[4A\x1b[?2026l",
+        );
+        term.feed("\x1b[?2026h\x1b[2D\x1b[3B\r\x1b[6C\x1b[4A## Claude\x1b[?2026l");
+
+        let lines = term.rendered_lines();
+        assert_eq!(lines[0], "      ## Claude");
+        assert_eq!(lines[1], "main preserved");
     }
 }
