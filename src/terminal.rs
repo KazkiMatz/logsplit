@@ -2,6 +2,8 @@ use std::cmp::{max, min};
 
 use unicode_width::UnicodeWidthChar;
 
+const SYNC_REPAINT_MIN_CURSOR_UP: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Style {
     pub fg: Option<u8>,
@@ -61,6 +63,8 @@ pub struct VirtualTerminal {
     osc_escape: bool,
     sync_active: bool,
     sync_full_repaint: bool,
+    sync_block_repaint: bool,
+    sync_block_repaint_probe: bool,
     sync_repaint_cleared_rows: Vec<bool>,
     line_dirty_min_col: Option<usize>,
 }
@@ -83,6 +87,8 @@ impl VirtualTerminal {
             osc_escape: false,
             sync_active: false,
             sync_full_repaint: false,
+            sync_block_repaint: false,
+            sync_block_repaint_probe: false,
             sync_repaint_cleared_rows: Vec::new(),
             line_dirty_min_col: None,
         };
@@ -106,6 +112,8 @@ impl VirtualTerminal {
         self.osc_escape = false;
         self.sync_active = false;
         self.sync_full_repaint = false;
+        self.sync_block_repaint = false;
+        self.sync_block_repaint_probe = false;
         self.sync_repaint_cleared_rows = vec![false; self.rows];
         self.line_dirty_min_col = None;
     }
@@ -495,6 +503,7 @@ impl VirtualTerminal {
         if self.cursor.row >= self.rows {
             self.cursor.row = self.rows.saturating_sub(1);
         }
+        self.probe_sync_block_repaint(ch);
         self.clear_sync_repaint_row();
         self.mark_line_dirty(self.cursor.col);
         let row = &mut self.screen[self.cursor.row];
@@ -544,7 +553,10 @@ impl VirtualTerminal {
         if amount > 0 {
             self.line_dirty_min_col = None;
         }
-        if self.sync_active && amount > 0 && amount >= self.rows.saturating_sub(1) {
+        if self.sync_active && amount >= SYNC_REPAINT_MIN_CURSOR_UP {
+            self.sync_block_repaint_probe = true;
+        }
+        if self.sync_active && amount >= self.rows.saturating_sub(1) {
             self.sync_full_repaint = true;
             self.sync_repaint_cleared_rows.fill(false);
         }
@@ -724,11 +736,24 @@ impl VirtualTerminal {
     fn set_sync_active(&mut self, active: bool) {
         self.sync_active = active;
         self.sync_full_repaint = false;
+        self.sync_block_repaint = false;
+        self.sync_block_repaint_probe = false;
         self.sync_repaint_cleared_rows.fill(false);
     }
 
+    fn probe_sync_block_repaint(&mut self, ch: char) {
+        if !self.sync_active || !self.sync_block_repaint_probe {
+            return;
+        }
+        self.sync_block_repaint_probe = false;
+        if ch == '─' && self.cursor.col <= 2 {
+            self.sync_block_repaint = true;
+            self.sync_repaint_cleared_rows.fill(false);
+        }
+    }
+
     fn clear_sync_repaint_row(&mut self) {
-        if !self.sync_active || !self.sync_full_repaint {
+        if !self.sync_active || !(self.sync_full_repaint || self.sync_block_repaint) {
             return;
         }
         if self.cursor.row >= self.sync_repaint_cleared_rows.len()
@@ -1023,5 +1048,42 @@ mod tests {
 
         let lines = term.rendered_lines();
         assert_eq!(lines[2], "  Codex round 9");
+    }
+
+    #[test]
+    fn synchronized_repaint_block_blanks_stale_cursor_forward_gaps() {
+        let mut term = VirtualTerminal::new(6, 80);
+        term.feed("\x1b[3;1HRestore the code and/or conversation tobthe pointrbefore…");
+        term.feed("\x1b[6;1H");
+        term.feed(
+            "\x1b[?2026h\x1b[4A\x1b[34m────\r\x1b[2C\x1b[1B\
+             Restore the code and/or conversation\x1b[1Cto\x1b[1Cthe\x1b[1Cpoint\x1b[1Cbefore…\
+             \x1b[?2026l",
+        );
+
+        let lines = term.rendered_lines();
+        assert_eq!(
+            lines[2],
+            "  Restore the code and/or conversation to the point before…"
+        );
+    }
+
+    #[test]
+    fn synchronized_sparse_update_without_modal_rule_preserves_skipped_cells() {
+        let mut term = VirtualTerminal::new(6, 120);
+        term.feed("\x1b[3;1H  - cl-admin-2 issue #331 — implements the JWT emitter + reverse proxy");
+        term.feed("\x1b[6;1H");
+        term.feed(
+            "\x1b[?2026h\x1b[4A\x1b[2C-\
+             \x1b[1Ccl-admin-2\x1b[1Cissue\x1b[1C#331\x1b[1C—\
+             \x1b[1Cimplements\x1b[1Cthe\x1b[1CJWT\x1b[1Cemitter\
+             \x1b[1C+\x1b[1Creverse\x1b[1Cproxy\x1b[?2026l",
+        );
+
+        let lines = term.rendered_lines();
+        assert_eq!(
+            lines[1],
+            "  - cl-admin-2 issue #331 — implements the JWT emitter + reverse proxy"
+        );
     }
 }
