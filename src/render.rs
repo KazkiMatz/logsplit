@@ -10,6 +10,7 @@ use crossterm::style::{
 use crate::terminal::{Cell, Style, char_width};
 
 pub fn apply_style(stdout: &mut io::Stdout, style: Style) -> io::Result<()> {
+    let style = readable_style(style);
     queue!(stdout, SetAttribute(Attribute::Reset), ResetColor)?;
     if let Some(fg) = style.fg {
         queue!(stdout, SetForegroundColor(Color::AnsiValue(fg)))?;
@@ -27,6 +28,13 @@ pub fn apply_style(stdout: &mut io::Stdout, style: Style) -> io::Result<()> {
         queue!(stdout, SetAttribute(Attribute::Reverse))?;
     }
     Ok(())
+}
+
+fn readable_style(mut style: Style) -> Style {
+    if style.fg == Some(0) && style.bg.is_none() && !style.reverse {
+        style.fg = None;
+    }
+    style
 }
 
 pub fn draw_cells(
@@ -142,4 +150,30 @@ pub fn clear_segment(
         Print(" ".repeat(width))
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn black_foreground_on_default_background_uses_default_foreground() {
+        let style = readable_style(Style {
+            fg: Some(0),
+            ..Style::default()
+        });
+
+        assert_eq!(style.fg, None);
+    }
+
+    #[test]
+    fn black_foreground_on_explicit_background_is_preserved() {
+        let style = readable_style(Style {
+            fg: Some(0),
+            bg: Some(7),
+            ..Style::default()
+        });
+
+        assert_eq!(style.fg, Some(0));
+    }
 }
