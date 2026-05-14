@@ -60,6 +60,8 @@ pub struct VirtualTerminal {
     osc: String,
     osc_escape: bool,
     sync_active: bool,
+    sync_full_repaint: bool,
+    sync_repaint_cleared_rows: Vec<bool>,
     line_dirty_min_col: Option<usize>,
 }
 
@@ -80,6 +82,8 @@ impl VirtualTerminal {
             osc: String::new(),
             osc_escape: false,
             sync_active: false,
+            sync_full_repaint: false,
+            sync_repaint_cleared_rows: Vec::new(),
             line_dirty_min_col: None,
         };
         term.reset(false);
@@ -101,6 +105,8 @@ impl VirtualTerminal {
         self.osc.clear();
         self.osc_escape = false;
         self.sync_active = false;
+        self.sync_full_repaint = false;
+        self.sync_repaint_cleared_rows = vec![false; self.rows];
         self.line_dirty_min_col = None;
     }
 
@@ -150,6 +156,7 @@ impl VirtualTerminal {
         self.cursor.col = min(logical_cursor_col, max_col);
         self.saved_cursor.col = min(self.saved_cursor.col, max_col);
         self.wrap_pending = false;
+        self.sync_repaint_cleared_rows.resize(self.rows, false);
         self.line_dirty_min_col = None;
     }
 
@@ -385,7 +392,7 @@ impl VirtualTerminal {
             's' => self.saved_cursor = self.cursor,
             'u' => self.cursor = self.saved_cursor,
             'h' | 'l' if private == '?' && params.iter().any(|param| *param == Some(2026)) => {
-                self.sync_active = final_char == 'h';
+                self.set_sync_active(final_char == 'h');
             }
             'h' | 'l' => {}
             'n' if private == '?' => {}
@@ -488,6 +495,7 @@ impl VirtualTerminal {
         if self.cursor.row >= self.rows {
             self.cursor.row = self.rows.saturating_sub(1);
         }
+        self.clear_sync_repaint_row();
         self.mark_line_dirty(self.cursor.col);
         let row = &mut self.screen[self.cursor.row];
         row[self.cursor.col] = Cell {
@@ -535,6 +543,10 @@ impl VirtualTerminal {
     fn cursor_up(&mut self, amount: usize) {
         if amount > 0 {
             self.line_dirty_min_col = None;
+        }
+        if self.sync_active && amount > 0 && amount >= self.rows.saturating_sub(1) {
+            self.sync_full_repaint = true;
+            self.sync_repaint_cleared_rows.fill(false);
         }
         self.cursor.row = self.cursor.row.saturating_sub(amount);
     }
@@ -707,6 +719,26 @@ impl VirtualTerminal {
             return false;
         };
         self.sync_active && self.cursor.row + 1 >= self.rows && min_col >= self.cols / 2
+    }
+
+    fn set_sync_active(&mut self, active: bool) {
+        self.sync_active = active;
+        self.sync_full_repaint = false;
+        self.sync_repaint_cleared_rows.fill(false);
+    }
+
+    fn clear_sync_repaint_row(&mut self) {
+        if !self.sync_active || !self.sync_full_repaint {
+            return;
+        }
+        if self.cursor.row >= self.sync_repaint_cleared_rows.len()
+            || self.sync_repaint_cleared_rows[self.cursor.row]
+        {
+            return;
+        }
+        self.screen[self.cursor.row] = vec![Cell::blank(Style::default()); self.cols];
+        self.sync_repaint_cleared_rows[self.cursor.row] = true;
+        self.mark_line_dirty(0);
     }
 }
 
@@ -980,5 +1012,16 @@ mod tests {
         let lines = term.rendered_lines();
         assert_eq!(lines[0], "      ## Claude");
         assert_eq!(lines[1], "main preserved");
+    }
+
+    #[test]
+    fn synchronized_full_repaint_blanks_stale_cursor_forward_gaps() {
+        let mut term = VirtualTerminal::new(6, 50);
+        term.feed("\x1b[3;1HReading additional input from stdin...");
+        term.feed("\x1b[6;1H");
+        term.feed("\x1b[?2026h\x1b[5A\x1b[2B  Codex\x1b[1Cround\x1b[1C9\x1b[?2026l");
+
+        let lines = term.rendered_lines();
+        assert_eq!(lines[2], "  Codex round 9");
     }
 }
