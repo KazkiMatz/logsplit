@@ -252,7 +252,7 @@ impl ViewerCore {
         &self.term
     }
 
-    pub fn lines(&self) -> Vec<String> {
+    pub fn lines(&mut self) -> Vec<String> {
         self.term.rendered_lines()
     }
 
