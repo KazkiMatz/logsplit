@@ -5,7 +5,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell as AlacrittyCell, Flags};
 use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
 use unicode_width::UnicodeWidthChar;
 
 const SCROLLBACK_HISTORY: usize = 1_000_000;
@@ -34,6 +34,12 @@ impl Cell {
             wide_cont: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalCursor {
+    pub row: usize,
+    pub col: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +148,21 @@ impl VirtualTerminal {
 
     pub fn screen_rows(&self) -> &[Vec<Cell>] {
         &self.screen
+    }
+
+    pub fn cursor(&self) -> Option<TerminalCursor> {
+        let cursor = self.term.renderable_content().cursor;
+        if cursor.shape == CursorShape::Hidden || cursor.point.line.0 < 0 {
+            return None;
+        }
+
+        let row = cursor.point.line.0 as usize;
+        let col = cursor.point.column.0;
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+
+        Some(TerminalCursor { row, col })
     }
 
     pub fn trimmed_screen_rows(&self) -> Vec<Vec<Cell>> {
@@ -422,5 +443,29 @@ mod tests {
         term.feed("\rX\x1b[2CZ");
 
         assert_eq!(term.rendered_lines(), vec!["XbcZe"]);
+    }
+
+    #[test]
+    fn cursor_tracks_position_and_visibility() {
+        let mut term = VirtualTerminal::new(3, 10);
+        assert_eq!(
+            term.cursor(),
+            Some(super::TerminalCursor { row: 0, col: 0 })
+        );
+
+        term.feed("abc\r\nxy");
+        assert_eq!(
+            term.cursor(),
+            Some(super::TerminalCursor { row: 1, col: 2 })
+        );
+
+        term.feed("\x1b[?25l");
+        assert_eq!(term.cursor(), None);
+
+        term.feed("\x1b[?25h");
+        assert_eq!(
+            term.cursor(),
+            Some(super::TerminalCursor { row: 1, col: 2 })
+        );
     }
 }

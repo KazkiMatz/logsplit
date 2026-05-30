@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use crossterm::SynchronizedUpdate;
 use crossterm::cursor::MoveTo;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::queue;
 use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
 use crossterm::terminal;
@@ -493,6 +493,7 @@ impl App {
         let active_right_selection = self
             .selection
             .filter(|selection| selection.pane == Focus::Right);
+        let right_cursor = self.right.term.cursor();
 
         for y in 0..dims.rows {
             let mut row = vec![blank; total_width];
@@ -507,6 +508,9 @@ impl App {
                 let mut rendered = right_row.clone();
                 if let Some(selection) = active_right_selection {
                     apply_selection_highlight(&mut rendered, y, &selection.selection);
+                }
+                if let Some(cursor) = right_cursor.filter(|cursor| cursor.row == y) {
+                    apply_cursor_highlight(&mut rendered, cursor.col, self.focus == Focus::Right);
                 }
                 overlay_cells(&mut row, dims.separator_col + 1, &rendered, dims.right_cols);
             }
@@ -1986,16 +1990,23 @@ fn spawn_input_reader(tx: Sender<AppEvent>) {
     thread::spawn(move || {
         loop {
             match event::read() {
-                Ok(event @ Event::Key(_)) | Ok(event @ Event::Resize(_, _)) => {
+                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                    if tx.send(AppEvent::Terminal(Event::Key(key))).is_err() {
+                        debug_log("spawn_input_reader: receiver dropped");
+                        break;
+                    }
+                }
+                Ok(event @ Event::Resize(_, _)) => {
                     if tx.send(AppEvent::Terminal(event)).is_err() {
                         debug_log("spawn_input_reader: receiver dropped");
                         break;
                     }
                 }
+                Ok(Event::Key(_)) => {}
                 Ok(_) => {}
                 Err(err) => {
                     debug_log(&format!("spawn_input_reader: read error: {err}"));
-                    break;
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
         }
@@ -2092,6 +2103,10 @@ fn make_logfile_path(line: &str) -> io::Result<PathBuf> {
 }
 
 fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+
     match key.code {
         KeyCode::Char(ch) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2253,9 +2268,10 @@ fn selection_label(mode: SelectionMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalProtocol, is_switch_left_key, is_switch_right_key, resolve_shell_path_from,
+        TerminalProtocol, encode_key, is_switch_left_key, is_switch_right_key,
+        resolve_shell_path_from,
     };
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
@@ -2358,5 +2374,13 @@ mod tests {
         let end = protocol.process(b"\x1b[?2026l");
         assert!(!end.sync_active_after);
         assert!(end.sync_frame_finished);
+    }
+
+    #[test]
+    fn encode_key_ignores_release_events() {
+        let key =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+
+        assert_eq!(encode_key(key), None);
     }
 }
