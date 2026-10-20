@@ -96,6 +96,10 @@ When the right pane has focus, normal input is forwarded to the child process.
 `Ctrl-w` is reserved by `logsplit` for pane switching and is not forwarded to the child.
 `Ctrl-g` is used for global helper actions that should work from either pane.
 
+Copy and paste within `logsplit` use an in-memory clipboard belonging to that instance.
+They work over SSH without `pbcopy`, `pbpaste`, or a desktop session. The buffer
+is cleared when `logsplit` exits and is not shared with other instances or applications.
+
 Global controls:
 
 - `Ctrl-w h`
@@ -109,7 +113,7 @@ Global controls:
 - `Ctrl-g V`
   Start linewise visual selection in the currently focused pane.
 - `Ctrl-g p`
-  Paste clipboard contents into the right pane.
+  Paste internal clipboard contents into the right pane.
 
 ## Left Pane Viewer
 
@@ -183,11 +187,11 @@ Selection and clipboard:
 - `V`
   Start linewise visual selection.
 - `y`, `Y`
-  Copy the active selection to the system clipboard.
+  Copy the active selection to logsplit’s internal clipboard.
 - `Esc`
   Clear the active selection.
 - `p`, `P`
-  Paste clipboard contents into the right pane.
+  Paste internal clipboard contents into the right pane.
 
 Other:
 
