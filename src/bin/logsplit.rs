@@ -18,10 +18,9 @@ use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
 use crossterm::terminal;
 use logsplit_rs::{
     Cell, Selection, SelectionMode, SelectionPoint, Style, TerminalGuard, TranscriptRecorder,
-    ViewerCore, VirtualTerminal, WordMotion, apply_selection_highlight, clear_segment,
-    copy_to_clipboard, debug_log, debug_timing, draw_cells, first_selectable_col,
-    last_selectable_col, move_word_point, next_col, normalize_col, overlay_cells,
-    paste_from_clipboard, previous_col, row_to_text, selection_text,
+    ViewerCore, VirtualTerminal, WordMotion, apply_selection_highlight, clear_segment, debug_log,
+    debug_timing, draw_cells, first_selectable_col, last_selectable_col, move_word_point, next_col,
+    normalize_col, overlay_cells, previous_col, row_to_text, selection_text,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -254,6 +253,7 @@ struct App {
     switch_prefix_pending: bool,
     left_cursor: SelectionPoint,
     selection: Option<ActiveSelection>,
+    clipboard: String,
     logfile: PathBuf,
     previous_frame: Option<FrameSnapshot>,
 }
@@ -300,6 +300,7 @@ impl App {
             switch_prefix_pending: false,
             left_cursor: SelectionPoint { row: 0, col: 0 },
             selection: None,
+            clipboard: String::new(),
             logfile,
             previous_frame: None,
         };
@@ -1564,56 +1565,43 @@ impl App {
                 selection_text(active.selection, |row| rows.get(row).cloned())
             }
         };
-        match copy_to_clipboard(&text) {
-            Ok(()) => {
-                self.selection = None;
-                self.left.status = format!(
-                    "Copied {} displayed line{} from {} pane",
-                    active.selection.line_span(),
-                    if active.selection.line_span() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                    match active.pane {
-                        Focus::Left => "left",
-                        Focus::Right => "right",
-                    }
-                );
+        self.clipboard = text;
+        self.selection = None;
+        self.left.status = format!(
+            "Copied {} displayed line{} from {} pane to internal clipboard",
+            active.selection.line_span(),
+            if active.selection.line_span() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            match active.pane {
+                Focus::Left => "left",
+                Focus::Right => "right",
             }
-            Err(err) => {
-                self.left.status = format!("Clipboard copy failed: {}", err);
-            }
-        }
+        );
         Ok(())
     }
 
     fn paste_right_from_clipboard(&mut self) {
-        match paste_from_clipboard() {
-            Ok(text) => {
-                if text.is_empty() {
-                    self.left.status = "Clipboard is empty".to_string();
-                    return;
-                }
-                if !self.right.alive {
-                    self.left.status = "Right pane is not running".to_string();
-                    return;
-                }
-                match self.right.write_input(text.as_bytes()) {
-                    Ok(()) => {
-                        self.left.status = format!(
-                            "Pasted {} byte{} into right pane",
-                            text.len(),
-                            if text.len() == 1 { "" } else { "s" }
-                        );
-                    }
-                    Err(err) => {
-                        self.left.status = format!("Paste failed: {}", err);
-                    }
-                }
+        if self.clipboard.is_empty() {
+            self.left.status = "Internal clipboard is empty; copy a selection first".to_string();
+            return;
+        }
+        if !self.right.alive {
+            self.left.status = "Right pane is not running".to_string();
+            return;
+        }
+        match self.right.write_input(self.clipboard.as_bytes()) {
+            Ok(()) => {
+                self.left.status = format!(
+                    "Pasted {} byte{} into right pane",
+                    self.clipboard.len(),
+                    if self.clipboard.len() == 1 { "" } else { "s" }
+                );
             }
             Err(err) => {
-                self.left.status = format!("Clipboard paste failed: {}", err);
+                self.left.status = format!("Paste failed: {}", err);
             }
         }
     }
